@@ -12,6 +12,12 @@ API_KEY = os.environ.get("API_KEY")
 
 API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 
+EXCLUDED_KEYWORDS = [
+    "youth", "u17", "u18", "u19", "u20", "u21", "u23",
+    "women", "feminine", "female",
+    "reserve", "reserves", "b team", "ii"
+]
+
 
 def send_telegram_message(text: str):
     if not BOT_TOKEN:
@@ -90,6 +96,20 @@ def call_api_football(endpoint: str, params=None):
         "status": "ok",
         "data": data
     }, 200
+
+
+def is_priority_fixture(match):
+    league_name = match.get("league", {}).get("name", "").lower()
+    home_name = match.get("teams", {}).get("home", {}).get("name", "").lower()
+    away_name = match.get("teams", {}).get("away", {}).get("name", "").lower()
+
+    combined_text = f"{league_name} {home_name} {away_name}"
+
+    for keyword in EXCLUDED_KEYWORDS:
+        if keyword in combined_text:
+            return False
+
+    return True
 
 
 @app.route("/")
@@ -198,6 +218,58 @@ def fixtures_today():
     return jsonify({
         "status": "ok",
         "matches_count": len(fixtures),
+        "sample_sent": lines,
+        "telegram_status": telegram_data,
+        "telegram_http_status": telegram_status
+    }), 200
+
+
+@app.route("/fixtures-priority")
+def fixtures_priority():
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    params = {
+        "date": today
+    }
+
+    data, status_code = call_api_football("fixtures", params)
+
+    if status_code != 200:
+        return jsonify(data), status_code
+
+    api_data = data["data"]
+    fixtures = api_data.get("response", [])
+
+    filtered_fixtures = [match for match in fixtures if is_priority_fixture(match)]
+
+    if not filtered_fixtures:
+        message = "Aucun match prioritaire trouvé aujourd'hui après filtrage."
+        send_telegram_message(message)
+        return jsonify({
+            "status": "ok",
+            "message": message,
+            "raw_matches_count": len(fixtures),
+            "filtered_matches_count": 0
+        }), 200
+
+    selected_matches = filtered_fixtures[:5]
+
+    lines = []
+    for match in selected_matches:
+        home = match["teams"]["home"]["name"]
+        away = match["teams"]["away"]["name"]
+        league = match["league"]["name"]
+        match_time = match["fixture"]["date"]
+
+        lines.append(f"{home} vs {away} | {league} | {match_time}")
+
+    message = "Matchs prioritaires du jour :\n\n" + "\n".join(lines)
+    telegram_data, telegram_status = send_telegram_message(message)
+
+    return jsonify({
+        "status": "ok",
+        "raw_matches_count": len(fixtures),
+        "filtered_matches_count": len(filtered_fixtures),
         "sample_sent": lines,
         "telegram_status": telegram_data,
         "telegram_http_status": telegram_status
