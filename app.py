@@ -150,8 +150,62 @@ def build_fixture_record(match):
         "home": match.get("teams", {}).get("home", {}).get("name"),
         "away": match.get("teams", {}).get("away", {}).get("name")
     }
+def build_fixture_detail(match):
+    fixture = match.get("fixture", {})
+    league = match.get("league", {})
+    teams = match.get("teams", {})
+    goals = match.get("goals", {})
+    score = match.get("score", {})
 
+    return {
+        "fixture_id": fixture.get("id"),
+        "referee": fixture.get("referee"),
+        "timezone": fixture.get("timezone"),
+        "date": fixture.get("date"),
+        "timestamp": fixture.get("timestamp"),
+        "venue_name": fixture.get("venue", {}).get("name"),
+        "venue_city": fixture.get("venue", {}).get("city"),
+        "status_long": fixture.get("status", {}).get("long"),
+        "status_short": fixture.get("status", {}).get("short"),
+        "elapsed": fixture.get("status", {}).get("elapsed"),
+        "league_id": league.get("id"),
+        "league_name": league.get("name"),
+        "country": league.get("country"),
+        "season": league.get("season"),
+        "round": league.get("round"),
+        "home": teams.get("home", {}).get("name"),
+        "away": teams.get("away", {}).get("name"),
+        "home_winner": teams.get("home", {}).get("winner"),
+        "away_winner": teams.get("away", {}).get("winner"),
+        "goals_home": goals.get("home"),
+        "goals_away": goals.get("away"),
+        "halftime_home": score.get("halftime", {}).get("home"),
+        "halftime_away": score.get("halftime", {}).get("away"),
+        "fulltime_home": score.get("fulltime", {}).get("home"),
+        "fulltime_away": score.get("fulltime", {}).get("away")
+    }
 
+def get_fixture_by_id(fixture_id):
+    data, status_code = call_api_football("fixtures", {"id": fixture_id})
+
+    if status_code != 200:
+        return data, status_code
+
+    api_data = data["data"]
+    response = api_data.get("response", [])
+
+    if not response:
+        return {
+            "status": "error",
+            "message": f"No fixture found for fixture_id={fixture_id}"
+        }, 404
+
+    match = response[0]
+    return {
+        "status": "ok",
+        "fixture": match
+    }, 200
+    
 def is_pre_match_fixture(match):
     status = match.get("fixture", {}).get("status", {}).get("short", "")
     return status == "NS"
