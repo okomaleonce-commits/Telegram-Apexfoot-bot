@@ -6,6 +6,9 @@ app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+API_KEY = os.environ.get("API_KEY")
+
+API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 
 
 def send_telegram_message(text: str):
@@ -50,6 +53,43 @@ def send_telegram_message(text: str):
     }, 200
 
 
+def call_api_football(endpoint: str, params=None):
+    if not API_KEY:
+        return {
+            "status": "error",
+            "message": "API_KEY is missing"
+        }, 500
+
+    headers = {
+        "x-apisports-key": API_KEY
+    }
+
+    url = f"{API_FOOTBALL_BASE_URL}/{endpoint}"
+
+    try:
+        response = requests.get(url, headers=headers, params=params or {}, timeout=20)
+        data = response.json()
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "API-Football request failed",
+            "details": str(e)
+        }, 500
+
+    if not response.ok:
+        return {
+            "status": "error",
+            "message": "API-Football returned an HTTP error",
+            "http_status": response.status_code,
+            "api_response": data
+        }, 500
+
+    return {
+        "status": "ok",
+        "data": data
+    }, 200
+
+
 @app.route("/")
 def home():
     return "Apex Football Bot is running."
@@ -68,7 +108,8 @@ def health():
     return jsonify({
         "status": "ok",
         "bot_token_present": bool(BOT_TOKEN),
-        "chat_id_present": bool(CHAT_ID)
+        "chat_id_present": bool(CHAT_ID),
+        "api_key_present": bool(API_KEY)
     })
 
 
@@ -90,6 +131,26 @@ def send_custom():
 
     data, status_code = send_telegram_message(text)
     return jsonify(data), status_code
+
+
+@app.route("/football-test")
+def football_test():
+    data, status_code = call_api_football("countries")
+    if status_code != 200:
+        return jsonify(data), status_code
+
+    api_data = data["data"]
+    results = api_data.get("results", 0)
+
+    message = f"API-Football OK. Endpoint countries accessible. Résultats retournés: {results}"
+    telegram_data, telegram_status = send_telegram_message(message)
+
+    return jsonify({
+        "status": "ok",
+        "football_results": results,
+        "telegram_status": telegram_data,
+        "api_sample": api_data.get("response", [])[:3]
+    }), 200
 
 
 if __name__ == "__main__":
