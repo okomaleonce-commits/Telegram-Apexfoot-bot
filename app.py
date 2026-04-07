@@ -152,6 +152,11 @@ def build_fixture_record(match):
     }
 
 
+def is_pre_match_fixture(match):
+    status = match.get("fixture", {}).get("status", {}).get("short", "")
+    return status == "NS"
+
+
 @app.route("/")
 def home():
     return "Apex Football Bot is running."
@@ -417,6 +422,64 @@ def fixtures_ready():
         "ready_matches_count": len(structured_fixtures),
         "sample_sent": lines,
         "ready_fixtures": selected,
+        "telegram_status": telegram_data,
+        "telegram_http_status": telegram_status
+    }), 200
+
+
+@app.route("/fixtures-prematch-ready")
+def fixtures_prematch_ready():
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    params = {"date": today}
+
+    data, status_code = call_api_football("fixtures", params)
+
+    if status_code != 200:
+        return jsonify(data), status_code
+
+    api_data = data["data"]
+    fixtures = api_data.get("response", [])
+
+    priority_fixtures = [match for match in fixtures if is_priority_fixture(match)]
+    target_fixtures = [match for match in priority_fixtures if is_target_league_by_id(match)]
+    prematch_fixtures = [match for match in target_fixtures if is_pre_match_fixture(match)]
+
+    structured_fixtures = [build_fixture_record(match) for match in prematch_fixtures]
+
+    if not structured_fixtures:
+        message = "Aucun match pré-match prêt pour analyse aujourd'hui."
+        send_telegram_message(message)
+        return jsonify({
+            "status": "ok",
+            "raw_matches_count": len(fixtures),
+            "priority_matches_count": len(priority_fixtures),
+            "target_matches_count": len(target_fixtures),
+            "prematch_matches_count": 0,
+            "message": message
+        }), 200
+
+    selected = structured_fixtures[:8]
+
+    lines = []
+    for match in selected:
+        kickoff = format_match_time(match["kickoff_utc"])
+        lines.append(
+            f"{kickoff} | {match['home']} vs {match['away']} | "
+            f"{match['league_name']} ({match['country']}) | "
+            f"fixture_id={match['fixture_id']}"
+        )
+
+    message = "Matchs pré-match prêts pour analyse :\n\n" + "\n".join(lines)
+    telegram_data, telegram_status = send_telegram_message(message)
+
+    return jsonify({
+        "status": "ok",
+        "raw_matches_count": len(fixtures),
+        "priority_matches_count": len(priority_fixtures),
+        "target_matches_count": len(target_fixtures),
+        "prematch_matches_count": len(structured_fixtures),
+        "sample_sent": lines,
+        "prematch_fixtures": selected,
         "telegram_status": telegram_data,
         "telegram_http_status": telegram_status
     }), 200
