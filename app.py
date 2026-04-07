@@ -33,6 +33,18 @@ TARGET_LEAGUE_IDS = [
 
 
 # =========================
+# GLOBAL ERROR HANDLER
+# =========================
+@app.errorhandler(Exception)
+def handle_exception(e):
+    return jsonify({
+        "status": "error",
+        "message": "Unhandled server exception",
+        "details": str(e)
+    }), 500
+
+
+# =========================
 # TELEGRAM
 # =========================
 def send_telegram_message(text: str):
@@ -205,6 +217,7 @@ def build_fixture_detail_summary(match):
         "fixture_id": detail["fixture_id"],
         "home": detail["home"],
         "away": detail["away"],
+        "league_id": detail["league_id"],
         "league_name": detail["league_name"],
         "country": detail["country"],
         "season": detail["season"],
@@ -302,6 +315,21 @@ def extract_odds_summary(odds_response):
     }
 
 
+def extract_match_winner_odds(match_winner_market):
+    if not match_winner_market:
+        return None
+
+    result = {"Home": None, "Draw": None, "Away": None}
+
+    for value in match_winner_market.get("values", []):
+        label = value.get("value")
+        odd = value.get("odd")
+        if label in result:
+            result[label] = odd
+
+    return result
+
+
 def implied_probability(decimal_odd):
     if decimal_odd is None:
         return None
@@ -327,57 +355,28 @@ def normalize_probabilities(prob_dict):
     }
 
 
-def extract_match_winner_odds(match_winner_market):
-    if not match_winner_market:
-        return None
-
-    result = {"Home": None, "Draw": None, "Away": None}
-
-    for value in match_winner_market.get("values", []):
-        label = value.get("value")
-        odd = value.get("odd")
-        if label in result:
-            result[label] = odd
-
-    return result
-
-
 def count_wins(form_string):
     if not form_string:
         return 0
     return form_string.count("W")
 
 
-def count_losses(form_string):
-    if not form_string:
-        return 0
-    return form_string.count("L")
-
-
 def build_value_decision(context, normalized_probs):
-    """
-    Logique simple et volontairement prudente.
-    Si le contexte et le marché racontent presque la même chose -> NO_BET.
-    On ne force pas une value imaginaire.
-    """
     home_score = 0
     away_score = 0
 
-    # Classement
     if context["home_rank"] is not None and context["away_rank"] is not None:
         if context["home_rank"] < context["away_rank"]:
             home_score += 1
         elif context["away_rank"] < context["home_rank"]:
             away_score += 1
 
-    # Points
     if context["home_points"] is not None and context["away_points"] is not None:
         if context["home_points"] > context["away_points"]:
             home_score += 1
         elif context["away_points"] > context["home_points"]:
             away_score += 1
 
-    # Forme
     home_wins = count_wins(context["home_form"])
     away_wins = count_wins(context["away_form"])
     if home_wins > away_wins:
@@ -385,14 +384,12 @@ def build_value_decision(context, normalized_probs):
     elif away_wins > home_wins:
         away_score += 1
 
-    # Défense
     if context["home_goals_against"] is not None and context["away_goals_against"] is not None:
         if context["home_goals_against"] < context["away_goals_against"]:
             home_score += 1
         elif context["away_goals_against"] < context["home_goals_against"]:
             away_score += 1
 
-    # Attaque
     if context["home_goals_for"] is not None and context["away_goals_for"] is not None:
         if context["home_goals_for"] > context["away_goals_for"]:
             home_score += 1
@@ -464,382 +461,6 @@ def health():
     })
 
 
-@app.route("/send-test")
-def send_test():
-    data, status = send_telegram_message("Test OK depuis Render vers Telegram.")
-    return jsonify(data), status
-
-
-@app.route("/send-custom")
-def send_custom():
-    text = request.args.get("text", "").strip()
-
-    if not text:
-        return jsonify({
-            "status": "error",
-            "message": "Missing 'text' query parameter"
-        }), 400
-
-    data, status = send_telegram_message(text)
-    return jsonify(data), status
-
-
-@app.route("/football-test")
-def football_test():
-    data, status_code = call_api_football("countries")
-
-    if status_code != 200:
-        return jsonify(data), status_code
-
-    results = data["data"].get("results", 0)
-    telegram_data, telegram_status = send_telegram_message(
-        f"API-Football OK. Endpoint countries accessible. Résultats retournés: {results}"
-    )
-
-    return jsonify({
-        "status": "ok",
-        "football_results": results,
-        "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status,
-        "api_sample": data["data"].get("response", [])[:3]
-    }), 200
-
-
-@app.route("/fixtures-prematch-ready")
-def fixtures_prematch_ready():
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    data, status_code = call_api_football("fixtures", {"date": today})
-
-    if status_code != 200:
-        return jsonify(data), status_code
-
-    fixtures = data["data"].get("response", [])
-
-    prematch = [
-        m for m in fixtures
-        if is_priority_fixture(m)
-        and is_target_league_by_id(m)
-        and is_pre_match_fixture(m)
-    ]
-
-    structured = [build_fixture_record(m) for m in prematch]
-    selected = structured[:5]
-
-    lines = [
-        f"{format_match_time(m['kickoff_utc'])} | {m['home']} vs {m['away']} | {m['league_name']} | id={m['fixture_id']}"
-        for m in selected
-    ]
-
-    if lines:
-        send_telegram_message("PREMATCH:\n\n" + "\n".join(lines))
-
-    return jsonify({
-        "status": "ok",
-        "count": len(structured),
-        "sample": selected
-    }), 200
-
-
-@app.route("/fixture-detail")
-def fixture_detail():
-    fixture_id = request.args.get("fixture_id", "").strip()
-
-    if not fixture_id:
-        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-
-    if not fixture_id.isdigit():
-        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
-
-    data, status_code = get_fixture_by_id(fixture_id)
-    if status_code != 200:
-        return jsonify(data), status_code
-
-    detail = build_fixture_detail(data["fixture"])
-    message = (
-        "Détail du match :\n\n"
-        f"{format_match_time(detail['date'])} | {detail['home']} vs {detail['away']}\n"
-        f"Ligue : {detail['league_name']} ({detail['country']})\n"
-        f"Round : {detail['round']}\n"
-        f"Statut : {detail['status_long']} ({detail['status_short']})\n"
-        f"Stade : {detail['venue_name']} - {detail['venue_city']}\n"
-        f"fixture_id={detail['fixture_id']}"
-    )
-
-    telegram_data, telegram_status = send_telegram_message(message)
-
-    return jsonify({
-        "status": "ok",
-        "fixture_detail": detail,
-        "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status
-    }), 200
-
-
-@app.route("/fixture-teams")
-def fixture_teams():
-    fixture_id = request.args.get("fixture_id", "").strip()
-
-    if not fixture_id:
-        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-
-    if not fixture_id.isdigit():
-        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
-
-    data, status_code = get_fixture_by_id(fixture_id)
-    if status_code != 200:
-        return jsonify(data), status_code
-
-    teams_info = build_fixture_teams_info(data["fixture"])
-
-    message = (
-        "Équipes du match :\n\n"
-        f"{teams_info['home_team_name']} (team_id={teams_info['home_team_id']})\n"
-        "vs\n"
-        f"{teams_info['away_team_name']} (team_id={teams_info['away_team_id']})\n\n"
-        f"Ligue : {teams_info['league_name']} ({teams_info['country']})\n"
-        f"Saison : {teams_info['season']}\n"
-        f"fixture_id={teams_info['fixture_id']}"
-    )
-
-    telegram_data, telegram_status = send_telegram_message(message)
-
-    return jsonify({
-        "status": "ok",
-        "teams_info": teams_info,
-        "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status
-    }), 200
-
-
-@app.route("/fixture-standings")
-def fixture_standings():
-    fixture_id = request.args.get("fixture_id", "").strip()
-
-    if not fixture_id:
-        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-
-    if not fixture_id.isdigit():
-        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
-
-    fixture_data, fixture_status = get_fixture_by_id(fixture_id)
-    if fixture_status != 200:
-        return jsonify(fixture_data), fixture_status
-
-    match = fixture_data["fixture"]
-    teams_info = build_fixture_teams_info(match)
-
-    standings_data, standings_status = call_api_football(
-        "standings",
-        {
-            "league": teams_info["league_id"],
-            "season": teams_info["season"]
-        }
-    )
-
-    if standings_status != 200:
-        return jsonify(standings_data), standings_status
-
-    standings_response = standings_data["data"].get("response", [])
-
-    home_standing = find_team_standing(standings_response, teams_info["home_team_id"])
-    away_standing = find_team_standing(standings_response, teams_info["away_team_id"])
-
-    message = (
-        "Classement du match :\n\n"
-        f"{teams_info['home_team_name']} : "
-        f"#{home_standing['rank'] if home_standing else 'N/A'} | "
-        f"{home_standing['points'] if home_standing else 'N/A'} pts | "
-        f"Forme: {home_standing['form'] if home_standing else 'N/A'}\n"
-        f"{teams_info['away_team_name']} : "
-        f"#{away_standing['rank'] if away_standing else 'N/A'} | "
-        f"{away_standing['points'] if away_standing else 'N/A'} pts | "
-        f"Forme: {away_standing['form'] if away_standing else 'N/A'}\n\n"
-        f"Ligue : {teams_info['league_name']} ({teams_info['country']})\n"
-        f"Saison : {teams_info['season']}\n"
-        f"fixture_id={teams_info['fixture_id']}"
-    )
-
-    telegram_data, telegram_status = send_telegram_message(message)
-
-    return jsonify({
-        "status": "ok",
-        "teams_info": teams_info,
-        "home_standing": home_standing,
-        "away_standing": away_standing,
-        "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status
-    }), 200
-
-
-@app.route("/fixture-context")
-def fixture_context():
-    fixture_id = request.args.get("fixture_id", "").strip()
-
-    if not fixture_id:
-        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-
-    if not fixture_id.isdigit():
-        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
-
-    fixture_data, fixture_status = get_fixture_by_id(fixture_id)
-    if fixture_status != 200:
-        return jsonify(fixture_data), fixture_status
-
-    match = fixture_data["fixture"]
-
-    detail = build_fixture_detail(match)
-    teams = build_fixture_teams_info(match)
-
-    standings_data, standings_status = call_api_football(
-        "standings",
-        {
-            "league": detail["league_id"],
-            "season": detail["season"]
-        }
-    )
-
-    if standings_status != 200:
-        return jsonify(standings_data), standings_status
-
-    standings = standings_data["data"].get("response", [])
-    home = find_team_standing(standings, teams["home_team_id"])
-    away = find_team_standing(standings, teams["away_team_id"])
-
-    context = {
-        "fixture": {
-            "fixture_id": detail["fixture_id"],
-            "date": detail["date"],
-            "league_id": detail["league_id"],
-            "league_name": detail["league_name"],
-            "country": detail["country"],
-            "round": detail["round"],
-            "season": detail["season"],
-            "home": detail["home"],
-            "away": detail["away"]
-        },
-        "teams": {
-            "home_id": teams["home_team_id"],
-            "home_name": teams["home_team_name"],
-            "away_id": teams["away_team_id"],
-            "away_name": teams["away_team_name"]
-        },
-        "home_rank": home["rank"] if home else None,
-        "away_rank": away["rank"] if away else None,
-        "home_points": home["points"] if home else None,
-        "away_points": away["points"] if away else None,
-        "home_form": home["form"] if home else None,
-        "away_form": away["form"] if away else None,
-        "home_goals_for": home["goals_for"] if home else None,
-        "home_goals_against": home["goals_against"] if home else None,
-        "away_goals_for": away["goals_for"] if away else None,
-        "away_goals_against": away["goals_against"] if away else None
-    }
-
-    message = (
-        f"{detail['home']} vs {detail['away']}\n\n"
-        f"Classement: {context['home_rank']} vs {context['away_rank']}\n"
-        f"Points: {context['home_points']} vs {context['away_points']}\n"
-        f"Forme: {context['home_form']} vs {context['away_form']}\n"
-        f"Buts: {context['home_goals_for']} vs {context['away_goals_for']}"
-    )
-
-    telegram_data, telegram_status = send_telegram_message(message)
-
-    return jsonify({
-        "status": "ok",
-        "context": context,
-        "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status
-    }), 200
-
-
-@app.route("/fixture-odds")
-def fixture_odds():
-    fixture_id = request.args.get("fixture_id", "").strip()
-    bookmaker_id = request.args.get("bookmaker", "").strip()
-    bet_id = request.args.get("bet", "").strip()
-
-    if not fixture_id:
-        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-
-    if not fixture_id.isdigit():
-        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
-
-    params = {"fixture": fixture_id}
-
-    if bookmaker_id:
-        if not bookmaker_id.isdigit():
-            return jsonify({"status": "error", "message": "bookmaker must be numeric"}), 400
-        params["bookmaker"] = bookmaker_id
-
-    if bet_id:
-        if not bet_id.isdigit():
-            return jsonify({"status": "error", "message": "bet must be numeric"}), 400
-        params["bet"] = bet_id
-
-    odds_data, odds_status = call_api_football("odds", params)
-
-    if odds_status != 200:
-        return jsonify(odds_data), odds_status
-
-    odds_response = odds_data["data"].get("response", [])
-
-    if not odds_response:
-        return jsonify({
-            "status": "ok",
-            "message": "No odds found for this fixture",
-            "odds_response_count": 0
-        }), 200
-
-    summary = extract_odds_summary(odds_response)
-
-    fixture_data, fixture_status = get_fixture_by_id(fixture_id)
-    if fixture_status == 200:
-        detail = build_fixture_detail(fixture_data["fixture"])
-        match_label = f"{detail['home']} vs {detail['away']}"
-    else:
-        match_label = f"fixture_id={fixture_id}"
-
-    if summary["match_winner"]:
-        values = summary["match_winner"]["values"]
-        values_text = " | ".join(
-            f"{v.get('value')}: {v.get('odd')}" for v in values
-        )
-        message = (
-            "Odds du match :\n\n"
-            f"{match_label}\n"
-            f"Bookmaker: {summary['bookmaker_name']}\n"
-            f"{summary['match_winner']['bet_name']} -> {values_text}"
-        )
-    else:
-        preview_lines = []
-        for market in summary["markets_preview"]:
-            vals = " | ".join(
-                f"{v.get('value')}: {v.get('odd')}" for v in market.get("values", [])
-            )
-            preview_lines.append(f"{market.get('bet_name')} -> {vals}")
-
-        message = (
-            "Odds du match :\n\n"
-            f"{match_label}\n"
-            f"Bookmaker: {summary['bookmaker_name']}\n"
-            + "\n".join(preview_lines)
-        )
-
-    telegram_data, telegram_status = send_telegram_message(message)
-
-    return jsonify({
-        "status": "ok",
-        "fixture_id": int(fixture_id),
-        "bookmaker_name": summary["bookmaker_name"],
-        "match_winner": summary["match_winner"],
-        "markets_preview": summary["markets_preview"],
-        "raw_response_count": len(odds_response),
-        "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status
-    }), 200
-
-
 @app.route("/fixture-value")
 def fixture_value():
     fixture_id = request.args.get("fixture_id", "").strip()
@@ -850,7 +471,6 @@ def fixture_value():
     if not fixture_id.isdigit():
         return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
 
-    # 1) Match
     fixture_data, fixture_status = get_fixture_by_id(fixture_id)
     if fixture_status != 200:
         return jsonify(fixture_data), fixture_status
@@ -859,15 +479,10 @@ def fixture_value():
     detail = build_fixture_detail_summary(match)
     teams = build_fixture_teams_info(match)
 
-    # 2) Standings
     standings_data, standings_status = call_api_football(
         "standings",
-        {
-            "league": detail["league_id"],
-            "season": detail["season"]
-        }
+        {"league": detail["league_id"], "season": detail["season"]}
     )
-
     if standings_status != 200:
         return jsonify(standings_data), standings_status
 
@@ -875,7 +490,6 @@ def fixture_value():
     home_standing = find_team_standing(standings_response, teams["home_team_id"])
     away_standing = find_team_standing(standings_response, teams["away_team_id"])
 
-    # 3) Context
     context = {
         "home_rank": home_standing["rank"] if home_standing else None,
         "away_rank": away_standing["rank"] if away_standing else None,
@@ -889,7 +503,6 @@ def fixture_value():
         "away_goals_against": away_standing["goals_against"] if away_standing else None
     }
 
-    # 4) Odds
     odds_data, odds_status = call_api_football("odds", {"fixture": fixture_id})
     if odds_status != 200:
         return jsonify(odds_data), odds_status
@@ -898,6 +511,7 @@ def fixture_value():
     if not odds_response:
         return jsonify({
             "status": "ok",
+            "fixture": detail,
             "decision": "NO_BET",
             "message": "No odds found for this fixture"
         }), 200
@@ -908,11 +522,19 @@ def fixture_value():
     if not match_winner_market:
         return jsonify({
             "status": "ok",
+            "fixture": detail,
             "decision": "NO_BET",
             "message": "No 1X2 market found for this fixture"
         }), 200
 
     odds_1x2 = extract_match_winner_odds(match_winner_market)
+    if not odds_1x2:
+        return jsonify({
+            "status": "ok",
+            "fixture": detail,
+            "decision": "NO_BET",
+            "message": "Could not extract 1X2 odds"
+        }), 200
 
     implied = {
         "Home": implied_probability(odds_1x2["Home"]),
@@ -921,11 +543,8 @@ def fixture_value():
     }
 
     normalized = normalize_probabilities(implied)
-
-    # 5) Decision
     decision_data = build_value_decision(context, normalized)
 
-    # 6) Telegram message
     message = (
         "VALUE ANALYSIS\n\n"
         f"{detail['home']} vs {detail['away']}\n"
@@ -960,6 +579,25 @@ def fixture_value():
     }), 200
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+@app.route("/debug-fixture-value")
+def debug_fixture_value():
+    fixture_id = request.args.get("fixture_id", "").strip()
+
+    if not fixture_id:
+        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
+
+    if not fixture_id.isdigit():
+        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
+
+    debug = {"fixture_id": fixture_id}
+
+    fixture_data, fixture_status = get_fixture_by_id(fixture_id)
+    debug["fixture_status"] = fixture_status
+    debug["fixture_data_keys"] = list(fixture_data.keys())
+
+    if fixture_status != 200:
+        return jsonify(debug), 200
+
+    match = fixture_data["fixture"]
+    detail = build_fixture_detail_summary(match)
+    teams = build_fixture_teams_inf
