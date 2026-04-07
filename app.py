@@ -32,9 +32,6 @@ TARGET_LEAGUE_IDS = [
 ]
 
 
-# =========================
-# GLOBAL ERROR HANDLER
-# =========================
 @app.errorhandler(Exception)
 def handle_exception(e):
     return jsonify({
@@ -137,6 +134,10 @@ def is_pre_match_fixture(match):
     return match.get("fixture", {}).get("status", {}).get("short") == "NS"
 
 
+def is_live_or_not_prematch(status_short):
+    return status_short != "NS"
+
+
 def format_match_time(iso_date: str):
     try:
         dt = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
@@ -223,7 +224,8 @@ def build_fixture_detail_summary(match):
         "season": detail["season"],
         "round": detail["round"],
         "date": detail["date"],
-        "status_short": detail["status_short"]
+        "status_short": detail["status_short"],
+        "status_long": detail["status_long"]
     }
 
 
@@ -477,6 +479,27 @@ def fixture_value():
 
     match = fixture_data["fixture"]
     detail = build_fixture_detail_summary(match)
+
+    # Garde-fou demandé
+    if is_live_or_not_prematch(detail["status_short"]):
+        message = (
+            "VALUE ANALYSIS BLOCKED\n\n"
+            f"{detail['home']} vs {detail['away']}\n"
+            f"Status: {detail['status_long']} ({detail['status_short']})\n"
+            "Decision: NO_BET\n"
+            "Reason: fixture is not pre-match anymore."
+        )
+        telegram_data, telegram_status = send_telegram_message(message)
+
+        return jsonify({
+            "status": "ok",
+            "fixture": detail,
+            "decision": "NO_BET",
+            "message": "Fixture is not pre-match anymore",
+            "telegram_status": telegram_data,
+            "telegram_http_status": telegram_status
+        }), 200
+
     teams = build_fixture_teams_info(match)
 
     standings_data, standings_status = call_api_football(
@@ -576,28 +599,4 @@ def fixture_value():
         "rationale": decision_data["rationale"],
         "telegram_status": telegram_data,
         "telegram_http_status": telegram_status
-    }), 200
-
-
-@app.route("/debug-fixture-value")
-def debug_fixture_value():
-    fixture_id = request.args.get("fixture_id", "").strip()
-
-    if not fixture_id:
-        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-
-    if not fixture_id.isdigit():
-        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
-
-    debug = {"fixture_id": fixture_id}
-
-    fixture_data, fixture_status = get_fixture_by_id(fixture_id)
-    debug["fixture_status"] = fixture_status
-    debug["fixture_data_keys"] = list(fixture_data.keys())
-
-    if fixture_status != 200:
-        return jsonify(debug), 200
-
-    match = fixture_data["fixture"]
-    detail = build_fixture_detail_summary(match)
-    teams = build_fixture_teams_inf
+ 
