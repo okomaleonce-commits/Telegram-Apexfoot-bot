@@ -147,6 +147,50 @@ def football_test():
 
     return jsonify({
         "status": "ok",
+        from datetime import datetime
+
+
+@app.route("/fixtures-today")
+def fixtures_today():
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    params = {
+        "date": today
+    }
+
+    data, status_code = call_api_football("fixtures", params)
+
+    if status_code != 200:
+        return jsonify(data), status_code
+
+    api_data = data["data"]
+    fixtures = api_data.get("response", [])
+
+    if not fixtures:
+        message = "Aucun match trouvé aujourd'hui."
+        send_telegram_message(message)
+        return jsonify({"status": "ok", "message": message})
+
+    # On limite à 5 matchs pour éviter spam
+    selected_matches = fixtures[:5]
+
+    lines = []
+    for match in selected_matches:
+        home = match["teams"]["home"]["name"]
+        away = match["teams"]["away"]["name"]
+        time = match["fixture"]["date"]
+
+        lines.append(f"{home} vs {away}")
+
+    message = "Matchs du jour :\n\n" + "\n".join(lines)
+
+    send_telegram_message(message)
+
+    return jsonify({
+        "status": "ok",
+        "matches_count": len(fixtures),
+        "sample_sent": lines
+    })
         "football_results": results,
         "telegram_status": telegram_data,
         "api_sample": api_data.get("response", [])[:3]
