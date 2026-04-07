@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+
 import requests
 from flask import Flask, jsonify, request
 
@@ -136,6 +138,7 @@ def send_custom():
 @app.route("/football-test")
 def football_test():
     data, status_code = call_api_football("countries")
+
     if status_code != 200:
         return jsonify(data), status_code
 
@@ -147,7 +150,11 @@ def football_test():
 
     return jsonify({
         "status": "ok",
-        from datetime import datetime
+        "football_results": results,
+        "telegram_status": telegram_data,
+        "telegram_http_status": telegram_status,
+        "api_sample": api_data.get("response", [])[:3]
+    }), 200
 
 
 @app.route("/fixtures-today")
@@ -169,31 +176,31 @@ def fixtures_today():
     if not fixtures:
         message = "Aucun match trouvé aujourd'hui."
         send_telegram_message(message)
-        return jsonify({"status": "ok", "message": message})
+        return jsonify({
+            "status": "ok",
+            "message": message
+        }), 200
 
-    # On limite à 5 matchs pour éviter spam
     selected_matches = fixtures[:5]
 
     lines = []
     for match in selected_matches:
         home = match["teams"]["home"]["name"]
         away = match["teams"]["away"]["name"]
-        time = match["fixture"]["date"]
+        league = match["league"]["name"]
+        match_time = match["fixture"]["date"]
 
-        lines.append(f"{home} vs {away}")
+        lines.append(f"{home} vs {away} | {league} | {match_time}")
 
     message = "Matchs du jour :\n\n" + "\n".join(lines)
-
-    send_telegram_message(message)
+    telegram_data, telegram_status = send_telegram_message(message)
 
     return jsonify({
         "status": "ok",
         "matches_count": len(fixtures),
-        "sample_sent": lines
-    })
-        "football_results": results,
+        "sample_sent": lines,
         "telegram_status": telegram_data,
-        "api_sample": api_data.get("response", [])[:3]
+        "telegram_http_status": telegram_status
     }), 200
 
 
