@@ -18,17 +18,19 @@ EXCLUDED_KEYWORDS = [
     "reserve", "reserves", "b team", "ii"
 ]
 
-TARGET_LEAGUES = [
-    "Premier League",
-    "La Liga",
-    "Bundesliga",
-    "Serie A",
-    "Ligue 1",
-    "Championship",
-    "Serie B",
-    "Liga Profesional Argentina",
-    "Liga Pro",
-    "Primera División"
+# IDs de ligues à cibler au début.
+# Tu pourras ajuster cette liste ensuite.
+TARGET_LEAGUE_IDS = [
+    39,   # Premier League (England)
+    140,  # La Liga (Spain)
+    78,   # Bundesliga (Germany)
+    135,  # Serie A (Italy)
+    61,   # Ligue 1 (France)
+    40,   # Championship (England)
+    71,   # Serie A (Brazil)
+    128,  # Liga Profesional Argentina
+    242,  # Liga Pro (Ecuador)
+    265   # Primera División (Chile) - exemple
 ]
 
 
@@ -125,9 +127,9 @@ def is_priority_fixture(match):
     return True
 
 
-def is_target_league(match):
-    league_name = match.get("league", {}).get("name", "")
-    return league_name in TARGET_LEAGUES
+def is_target_league_by_id(match):
+    league_id = match.get("league", {}).get("id")
+    return league_id in TARGET_LEAGUE_IDS
 
 
 def format_match_time(iso_date: str):
@@ -232,9 +234,10 @@ def fixtures_today():
         home = match["teams"]["home"]["name"]
         away = match["teams"]["away"]["name"]
         league = match["league"]["name"]
+        country = match["league"]["country"]
         match_time = format_match_time(match["fixture"]["date"])
 
-        lines.append(f"{match_time} | {home} vs {away} | {league}")
+        lines.append(f"{match_time} | {home} vs {away} | {league} ({country})")
 
     message = "Matchs du jour :\n\n" + "\n".join(lines)
     telegram_data, telegram_status = send_telegram_message(message)
@@ -279,9 +282,10 @@ def fixtures_priority():
         home = match["teams"]["home"]["name"]
         away = match["teams"]["away"]["name"]
         league = match["league"]["name"]
+        country = match["league"]["country"]
         match_time = format_match_time(match["fixture"]["date"])
 
-        lines.append(f"{match_time} | {home} vs {away} | {league}")
+        lines.append(f"{match_time} | {home} vs {away} | {league} ({country})")
 
     message = "Matchs prioritaires du jour :\n\n" + "\n".join(lines)
     telegram_data, telegram_status = send_telegram_message(message)
@@ -296,8 +300,8 @@ def fixtures_priority():
     }), 200
 
 
-@app.route("/fixtures-target")
-def fixtures_target():
+@app.route("/fixtures-target-ids")
+def fixtures_target_ids():
     today = datetime.utcnow().strftime("%Y-%m-%d")
     params = {"date": today}
 
@@ -310,10 +314,10 @@ def fixtures_target():
     fixtures = api_data.get("response", [])
 
     priority_fixtures = [match for match in fixtures if is_priority_fixture(match)]
-    target_fixtures = [match for match in priority_fixtures if is_target_league(match)]
+    target_fixtures = [match for match in priority_fixtures if is_target_league_by_id(match)]
 
     if not target_fixtures:
-        message = "Aucun match cible trouvé aujourd'hui dans les ligues sélectionnées."
+        message = "Aucun match cible trouvé aujourd'hui avec les IDs sélectionnés."
         send_telegram_message(message)
         return jsonify({
             "status": "ok",
@@ -330,11 +334,15 @@ def fixtures_target():
         home = match["teams"]["home"]["name"]
         away = match["teams"]["away"]["name"]
         league = match["league"]["name"]
+        country = match["league"]["country"]
+        league_id = match["league"]["id"]
         match_time = format_match_time(match["fixture"]["date"])
 
-        lines.append(f"{match_time} | {home} vs {away} | {league}")
+        lines.append(
+            f"{match_time} | {home} vs {away} | {league} ({country}) | league_id={league_id}"
+        )
 
-    message = "Matchs cibles du jour :\n\n" + "\n".join(lines)
+    message = "Matchs cibles du jour (IDs) :\n\n" + "\n".join(lines)
     telegram_data, telegram_status = send_telegram_message(message)
 
     return jsonify({
