@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from flask import Flask, jsonify, request
@@ -16,6 +16,19 @@ EXCLUDED_KEYWORDS = [
     "youth", "u17", "u18", "u19", "u20", "u21", "u23",
     "women", "feminine", "female",
     "reserve", "reserves", "b team", "ii"
+]
+
+TARGET_LEAGUES = [
+    "Premier League",
+    "La Liga",
+    "Bundesliga",
+    "Serie A",
+    "Ligue 1",
+    "Championship",
+    "Serie B",
+    "Liga Profesional Argentina",
+    "Liga Pro",
+    "Primera División"
 ]
 
 
@@ -112,6 +125,20 @@ def is_priority_fixture(match):
     return True
 
 
+def is_target_league(match):
+    league_name = match.get("league", {}).get("name", "")
+    return league_name in TARGET_LEAGUES
+
+
+def format_match_time(iso_date: str):
+    try:
+        dt = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
+        dt_utc = dt.astimezone(timezone.utc)
+        return dt_utc.strftime("%H:%M UTC")
+    except Exception:
+        return iso_date
+
+
 @app.route("/")
 def home():
     return "Apex Football Bot is running."
@@ -180,10 +207,7 @@ def football_test():
 @app.route("/fixtures-today")
 def fixtures_today():
     today = datetime.utcnow().strftime("%Y-%m-%d")
-
-    params = {
-        "date": today
-    }
+    params = {"date": today}
 
     data, status_code = call_api_football("fixtures", params)
 
@@ -208,9 +232,9 @@ def fixtures_today():
         home = match["teams"]["home"]["name"]
         away = match["teams"]["away"]["name"]
         league = match["league"]["name"]
-        match_time = match["fixture"]["date"]
+        match_time = format_match_time(match["fixture"]["date"])
 
-        lines.append(f"{home} vs {away} | {league} | {match_time}")
+        lines.append(f"{match_time} | {home} vs {away} | {league}")
 
     message = "Matchs du jour :\n\n" + "\n".join(lines)
     telegram_data, telegram_status = send_telegram_message(message)
@@ -227,10 +251,7 @@ def fixtures_today():
 @app.route("/fixtures-priority")
 def fixtures_priority():
     today = datetime.utcnow().strftime("%Y-%m-%d")
-
-    params = {
-        "date": today
-    }
+    params = {"date": today}
 
     data, status_code = call_api_football("fixtures", params)
 
@@ -239,7 +260,6 @@ def fixtures_priority():
 
     api_data = data["data"]
     fixtures = api_data.get("response", [])
-
     filtered_fixtures = [match for match in fixtures if is_priority_fixture(match)]
 
     if not filtered_fixtures:
@@ -259,9 +279,9 @@ def fixtures_priority():
         home = match["teams"]["home"]["name"]
         away = match["teams"]["away"]["name"]
         league = match["league"]["name"]
-        match_time = match["fixture"]["date"]
+        match_time = format_match_time(match["fixture"]["date"])
 
-        lines.append(f"{home} vs {away} | {league} | {match_time}")
+        lines.append(f"{match_time} | {home} vs {away} | {league}")
 
     message = "Matchs prioritaires du jour :\n\n" + "\n".join(lines)
     telegram_data, telegram_status = send_telegram_message(message)
@@ -270,6 +290,58 @@ def fixtures_priority():
         "status": "ok",
         "raw_matches_count": len(fixtures),
         "filtered_matches_count": len(filtered_fixtures),
+        "sample_sent": lines,
+        "telegram_status": telegram_data,
+        "telegram_http_status": telegram_status
+    }), 200
+
+
+@app.route("/fixtures-target")
+def fixtures_target():
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    params = {"date": today}
+
+    data, status_code = call_api_football("fixtures", params)
+
+    if status_code != 200:
+        return jsonify(data), status_code
+
+    api_data = data["data"]
+    fixtures = api_data.get("response", [])
+
+    priority_fixtures = [match for match in fixtures if is_priority_fixture(match)]
+    target_fixtures = [match for match in priority_fixtures if is_target_league(match)]
+
+    if not target_fixtures:
+        message = "Aucun match cible trouvé aujourd'hui dans les ligues sélectionnées."
+        send_telegram_message(message)
+        return jsonify({
+            "status": "ok",
+            "raw_matches_count": len(fixtures),
+            "priority_matches_count": len(priority_fixtures),
+            "target_matches_count": 0,
+            "message": message
+        }), 200
+
+    selected_matches = target_fixtures[:8]
+
+    lines = []
+    for match in selected_matches:
+        home = match["teams"]["home"]["name"]
+        away = match["teams"]["away"]["name"]
+        league = match["league"]["name"]
+        match_time = format_match_time(match["fixture"]["date"])
+
+        lines.append(f"{match_time} | {home} vs {away} | {league}")
+
+    message = "Matchs cibles du jour :\n\n" + "\n".join(lines)
+    telegram_data, telegram_status = send_telegram_message(message)
+
+    return jsonify({
+        "status": "ok",
+        "raw_matches_count": len(fixtures),
+        "priority_matches_count": len(priority_fixtures),
+        "target_matches_count": len(target_fixtures),
         "sample_sent": lines,
         "telegram_status": telegram_data,
         "telegram_http_status": telegram_status
