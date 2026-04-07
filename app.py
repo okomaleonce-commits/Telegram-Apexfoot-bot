@@ -480,7 +480,6 @@ def fixture_value():
     match = fixture_data["fixture"]
     detail = build_fixture_detail_summary(match)
 
-    # Garde-fou demandé
     if is_live_or_not_prematch(detail["status_short"]):
         message = (
             "VALUE ANALYSIS BLOCKED\n\n"
@@ -599,4 +598,76 @@ def fixture_value():
         "rationale": decision_data["rationale"],
         "telegram_status": telegram_data,
         "telegram_http_status": telegram_status
- 
+    }), 200
+
+
+@app.route("/debug-fixture-value")
+def debug_fixture_value():
+    fixture_id = request.args.get("fixture_id", "").strip()
+
+    if not fixture_id:
+        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
+
+    if not fixture_id.isdigit():
+        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
+
+    debug = {"fixture_id": fixture_id}
+
+    fixture_data, fixture_status = get_fixture_by_id(fixture_id)
+    debug["fixture_status"] = fixture_status
+    debug["fixture_data_keys"] = list(fixture_data.keys())
+
+    if fixture_status != 200:
+        return jsonify(debug), 200
+
+    match = fixture_data["fixture"]
+    detail = build_fixture_detail_summary(match)
+    teams = build_fixture_teams_info(match)
+
+    debug["detail"] = detail
+    debug["teams"] = teams
+
+    standings_data, standings_status = call_api_football(
+        "standings",
+        {"league": detail["league_id"], "season": detail["season"]}
+    )
+    debug["standings_status"] = standings_status
+
+    if standings_status == 200:
+        standings_response = standings_data["data"].get("response", [])
+        debug["standings_response_count"] = len(standings_response)
+
+        home_standing = find_team_standing(standings_response, teams["home_team_id"])
+        away_standing = find_team_standing(standings_response, teams["away_team_id"])
+
+        debug["home_standing_found"] = home_standing is not None
+        debug["away_standing_found"] = away_standing is not None
+    else:
+        debug["standings_error"] = standings_data
+
+    odds_data, odds_status = call_api_football("odds", {"fixture": fixture_id})
+    debug["odds_status"] = odds_status
+
+    if odds_status == 200:
+        odds_response = odds_data["data"].get("response", [])
+        debug["odds_response_count"] = len(odds_response)
+
+        odds_summary = extract_odds_summary(odds_response)
+        debug["bookmaker_name"] = odds_summary.get("bookmaker_name")
+        debug["match_winner_found"] = odds_summary.get("match_winner") is not None
+
+        if odds_summary.get("match_winner"):
+            debug["match_winner_market"] = odds_summary["match_winner"]
+            debug["odds_1x2"] = extract_match_winner_odds(odds_summary["match_winner"])
+    else:
+        debug["odds_error"] = odds_data
+
+    return jsonify({
+        "status": "ok",
+        "debug": debug
+    }), 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
