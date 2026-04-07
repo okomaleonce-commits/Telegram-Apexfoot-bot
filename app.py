@@ -130,6 +130,11 @@ def is_target_league_by_id(match):
     return league_id in TARGET_LEAGUE_IDS
 
 
+def is_pre_match_fixture(match):
+    status = match.get("fixture", {}).get("status", {}).get("short", "")
+    return status == "NS"
+
+
 def format_match_time(iso_date: str):
     try:
         dt = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
@@ -150,6 +155,8 @@ def build_fixture_record(match):
         "home": match.get("teams", {}).get("home", {}).get("name"),
         "away": match.get("teams", {}).get("away", {}).get("name")
     }
+
+
 def build_fixture_detail(match):
     fixture = match.get("fixture", {})
     league = match.get("league", {})
@@ -185,6 +192,7 @@ def build_fixture_detail(match):
         "fulltime_away": score.get("fulltime", {}).get("away")
     }
 
+
 def get_fixture_by_id(fixture_id):
     data, status_code = call_api_football("fixtures", {"id": fixture_id})
 
@@ -205,10 +213,6 @@ def get_fixture_by_id(fixture_id):
         "status": "ok",
         "fixture": match
     }, 200
-    
-def is_pre_match_fixture(match):
-    status = match.get("fixture", {}).get("status", {}).get("short", "")
-    return status == "NS"
 
 
 @app.route("/")
@@ -534,6 +538,51 @@ def fixtures_prematch_ready():
         "prematch_matches_count": len(structured_fixtures),
         "sample_sent": lines,
         "prematch_fixtures": selected,
+        "telegram_status": telegram_data,
+        "telegram_http_status": telegram_status
+    }), 200
+
+
+@app.route("/fixture-detail")
+def fixture_detail():
+    fixture_id = request.args.get("fixture_id", "").strip()
+
+    if not fixture_id:
+        return jsonify({
+            "status": "error",
+            "message": "Missing 'fixture_id' query parameter"
+        }), 400
+
+    if not fixture_id.isdigit():
+        return jsonify({
+            "status": "error",
+            "message": "fixture_id must be numeric"
+        }), 400
+
+    data, status_code = get_fixture_by_id(fixture_id)
+
+    if status_code != 200:
+        return jsonify(data), status_code
+
+    match = data["fixture"]
+    detail = build_fixture_detail(match)
+
+    kickoff = format_match_time(detail["date"])
+    message = (
+        "Détail du match :\n\n"
+        f"{kickoff} | {detail['home']} vs {detail['away']}\n"
+        f"Ligue : {detail['league_name']} ({detail['country']})\n"
+        f"Round : {detail['round']}\n"
+        f"Statut : {detail['status_long']} ({detail['status_short']})\n"
+        f"Stade : {detail['venue_name']} - {detail['venue_city']}\n"
+        f"fixture_id={detail['fixture_id']}"
+    )
+
+    telegram_data, telegram_status = send_telegram_message(message)
+
+    return jsonify({
+        "status": "ok",
+        "fixture_detail": detail,
         "telegram_status": telegram_data,
         "telegram_http_status": telegram_status
     }), 200
