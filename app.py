@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify, request
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 
@@ -98,6 +99,15 @@ def err(message: str, status_code: int = 400, **kwargs):
     payload = {"status": "error", "message": message}
     payload.update(kwargs)
     return jsonify(payload), status_code
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    return jsonify({
+        "status": "error",
+        "message": e.name,
+        "details": e.description,
+    }), e.code
 
 
 @app.errorhandler(Exception)
@@ -1133,6 +1143,7 @@ def home():
             "/fixture-goals-value?fixture_id=...",
             "/debug-fixture-value?fixture_id=...",
             "/fixtures-today",
+            "/fixtures-prematch-ready",
             "/scan-value",
             "/scan-goals",
         ],
@@ -1149,6 +1160,7 @@ def ping():
 
 
 @app.route("/fixtures-today")
+@app.route("/fixtures-prematch-ready")
 def fixtures_today():
     date_str = request.args.get("date", "").strip() or utc_today_str()
     data, status_code = get_fixtures_by_date(date_str)
