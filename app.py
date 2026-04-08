@@ -487,6 +487,32 @@ def compute_edges(model_probs, market_probs):
     return result
 
 
+def filtered_edges_by_issue(odds_1x2, edges):
+    """
+    On bloque uniquement l'issue concernée si sa cote est trop basse.
+    On ne bloque plus tout le match.
+    """
+    filtered = dict(edges)
+
+    try:
+        home_odd = float(odds_1x2["Home"]) if odds_1x2.get("Home") else None
+    except Exception:
+        home_odd = None
+
+    try:
+        away_odd = float(odds_1x2["Away"]) if odds_1x2.get("Away") else None
+    except Exception:
+        away_odd = None
+
+    if home_odd is not None and home_odd < 1.60:
+        filtered["Home"] = None
+
+    if away_odd is not None and away_odd < 1.60:
+        filtered["Away"] = None
+
+    return filtered
+
+
 def best_edge(edges):
     candidates = {k: v for k, v in edges.items() if v is not None}
     if not candidates:
@@ -502,47 +528,28 @@ def build_value_decision_with_edge(detail, odds_1x2, model_probs, market_probs, 
             "rationale": ["Le match n'est plus en pré-match."],
             "best_edge_label": None,
             "best_edge_value": None,
+            "allowed_edges": edges,
         }
 
-    try:
-        away_odd = float(odds_1x2["Away"]) if odds_1x2.get("Away") else None
-        home_odd = float(odds_1x2["Home"]) if odds_1x2.get("Home") else None
-    except Exception:
-        away_odd = None
-        home_odd = None
-
-    if away_odd is not None and away_odd < 1.60:
-        return {
-            "decision": "NO_BET",
-            "rationale": ["Cote away trop basse (< 1.60) : favori déjà trop pricé."],
-            "best_edge_label": None,
-            "best_edge_value": None,
-        }
-
-    if home_odd is not None and home_odd < 1.60:
-        return {
-            "decision": "NO_BET",
-            "rationale": ["Cote home trop basse (< 1.60) : favori déjà trop pricé."],
-            "best_edge_label": None,
-            "best_edge_value": None,
-        }
-
-    edge_label, edge_value = best_edge(edges)
+    allowed_edges = filtered_edges_by_issue(odds_1x2, edges)
+    edge_label, edge_value = best_edge(allowed_edges)
 
     if edge_label is None or edge_value is None:
         return {
             "decision": "NO_BET",
-            "rationale": ["Impossible de calculer un edge exploitable."],
+            "rationale": ["Aucune issue autorisée avec edge exploitable après filtres."],
             "best_edge_label": None,
             "best_edge_value": None,
+            "allowed_edges": allowed_edges,
         }
 
     if edge_value < 0.05:
         return {
             "decision": "NO_BET",
-            "rationale": ["Best edge < 5% : pas d'avantage suffisant contre le marché."],
+            "rationale": ["Best allowed edge < 5% : pas d'avantage suffisant contre le marché."],
             "best_edge_label": edge_label,
             "best_edge_value": edge_value,
+            "allowed_edges": allowed_edges,
         }
 
     label_map = {
@@ -554,11 +561,12 @@ def build_value_decision_with_edge(detail, odds_1x2, model_probs, market_probs, 
     return {
         "decision": label_map.get(edge_label, "NO_BET"),
         "rationale": [
-            f"Edge positif sur {edge_label}.",
-            f"Best edge = {round(edge_value * 100, 2)}%.",
+            f"Edge positif autorisé sur {edge_label}.",
+            f"Best allowed edge = {round(edge_value * 100, 2)}%.",
         ],
         "best_edge_label": edge_label,
         "best_edge_value": edge_value,
+        "allowed_edges": allowed_edges,
     }
 
 
@@ -644,10 +652,13 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
             if over_prob is not None and under_prob is not None and abs(over_prob - under_prob) < 0.05:
                 rationale.append("O/U 2.5 trop équilibré par le marché : NO_BET.")
             else:
-                if attack_signal >= 2 and concede_signal >= 2 and float(over_odd) >= 1.70:
-                    decision = "LEAN_OVER_2_5"
-                    rationale.append("Les moyennes offensives et défensives suggèrent un match ouvert.")
-                    rationale.append("Le profil global pousse vers 3 buts ou plus.")
+                # Blocage under si profil offensif adverse trop fort
+                if away_gf_avg is not None and away_gf_avg >= 1.80 and home_ga_avg is not None and home_ga_avg >= 1.30:
+                    rationale.append("Blocage UNDER : profil offensif/defensif incompatible avec un under propre.")
+                elif attack_signal <= 1 and concede_signal <= 1 and float(under_odd) >= 1.70:
+                    decision = "LEAN_UNDER_2_5"
+                    rationale.append("Le profil statistique ne soutient pas un match très ouvert.")
+                    rationale.append("Peu de signaux combinés pour dépasser 2.5 buts.")
                     return {
                         "decision": decision,
                         "rationale": rationale,
@@ -657,10 +668,10 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
                         "away_ga_avg": away_ga_avg,
                     }
 
-                if attack_signal <= 1 and concede_signal <= 1 and float(under_odd) >= 1.70:
-                    decision = "LEAN_UNDER_2_5"
-                    rationale.append("Le profil statistique ne soutient pas un match très ouvert.")
-                    rationale.append("Peu de signaux combinés pour dépasser 2.5 buts.")
+                if attack_signal >= 2 and concede_signal >= 2 and float(over_odd) >= 1.70:
+                    decision = "LEAN_OVER_2_5"
+                    rationale.append("Les moyennes offensives et défensives suggèrent un match ouvert.")
+                    rationale.append("Le profil global pousse vers 3 buts ou plus.")
                     return {
                         "decision": decision,
                         "rationale": rationale,
@@ -685,56 +696,6 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
 # =========================
 # ROUTES
 # =========================
-@app.route("/")
-def home():
-    return "Bot running"
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "bot_token_present": bool(BOT_TOKEN),
-        "chat_id_present": bool(CHAT_ID),
-        "api_key_present": bool(API_KEY),
-    })
-
-
-@app.route("/fixtures-prematch-ready")
-def fixtures_prematch_ready():
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    data, status_code = call_api_football("fixtures", {"date": today})
-
-    if status_code != 200:
-        return jsonify(data), status_code
-
-    fixtures = data["data"].get("response", [])
-
-    prematch = [
-        m for m in fixtures
-        if is_priority_fixture(m)
-        and is_target_league_by_id(m)
-        and is_pre_match_fixture(m)
-    ]
-
-    structured = [build_fixture_record(m) for m in prematch]
-    selected = structured[:5]
-
-    lines = [
-        f"{format_match_time(m['kickoff_utc'])} | {m['home']} vs {m['away']} | {m['league_name']} | id={m['fixture_id']}"
-        for m in selected
-    ]
-
-    if lines:
-        send_telegram_message("PREMATCH:\n\n" + "\n".join(lines))
-
-    return jsonify({
-        "status": "ok",
-        "count": len(structured),
-        "sample": selected,
-    }), 200
-
-
 @app.route("/fixture-value")
 def fixture_value():
     fixture_id = request.args.get("fixture_id", "").strip()
@@ -848,6 +809,8 @@ def fixture_value():
         edges=edges,
     )
 
+    allowed_edges = decision_data["allowed_edges"]
+
     message = (
         "VALUE ANALYSIS\n\n"
         f"{detail['home']} vs {detail['away']}\n"
@@ -867,6 +830,10 @@ def fixture_value():
         f"Home: {round(edges['Home'] * 100, 2) if edges['Home'] is not None else 'N/A'}%\n"
         f"Draw: {round(edges['Draw'] * 100, 2) if edges['Draw'] is not None else 'N/A'}%\n"
         f"Away: {round(edges['Away'] * 100, 2) if edges['Away'] is not None else 'N/A'}%\n\n"
+        f"Allowed edges:\n"
+        f"Home: {round(allowed_edges['Home'] * 100, 2) if allowed_edges['Home'] is not None else 'BLOCKED'}%\n"
+        f"Draw: {round(allowed_edges['Draw'] * 100, 2) if allowed_edges['Draw'] is not None else 'BLOCKED'}%\n"
+        f"Away: {round(allowed_edges['Away'] * 100, 2) if allowed_edges['Away'] is not None else 'BLOCKED'}%\n\n"
         f"Decision: {decision_data['decision']}\n"
         f"Rationale: {' | '.join(decision_data['rationale'])}"
     )
@@ -883,6 +850,7 @@ def fixture_value():
         "model_probabilities": model_probs,
         "model_raw_scores": model_data["raw_scores"],
         "edges": edges,
+        "allowed_edges": allowed_edges,
         "best_edge_label": decision_data["best_edge_label"],
         "best_edge_value": decision_data["best_edge_value"],
         "decision": decision_data["decision"],
