@@ -15,7 +15,7 @@ API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 EXCLUDED_KEYWORDS = [
     "youth", "u17", "u18", "u19", "u20", "u21", "u23",
     "women", "feminine", "female",
-    "reserve", "reserves", "b team", "ii"
+    "reserve", "reserves", "b team", "ii",
 ]
 
 TARGET_LEAGUE_IDS = [
@@ -28,7 +28,7 @@ TARGET_LEAGUE_IDS = [
     71,   # Serie A (Brazil)
     128,  # Liga Profesional Argentina
     242,  # Liga Pro (Ecuador)
-    265   # Primera División (Chile)
+    265,  # Primera División (Chile)
 ]
 
 
@@ -191,7 +191,7 @@ def build_fixture_detail(match):
         "halftime_home": score.get("halftime", {}).get("home"),
         "halftime_away": score.get("halftime", {}).get("away"),
         "fulltime_home": score.get("fulltime", {}).get("home"),
-        "fulltime_away": score.get("fulltime", {}).get("away")
+        "fulltime_away": score.get("fulltime", {}).get("away"),
     }
 
 
@@ -208,7 +208,7 @@ def build_fixture_teams_info(match):
         "home_team_id": teams.get("home", {}).get("id"),
         "home_team_name": teams.get("home", {}).get("name"),
         "away_team_id": teams.get("away", {}).get("id"),
-        "away_team_name": teams.get("away", {}).get("name")
+        "away_team_name": teams.get("away", {}).get("name"),
     }
 
 
@@ -225,7 +225,7 @@ def build_fixture_detail_summary(match):
         "round": detail["round"],
         "date": detail["date"],
         "status_short": detail["status_short"],
-        "status_long": detail["status_long"]
+        "status_long": detail["status_long"],
     }
 
 
@@ -266,7 +266,7 @@ def find_team_standing(standings_response, team_id):
                         "draw": team_row.get("all", {}).get("draw"),
                         "lose": team_row.get("all", {}).get("lose"),
                         "goals_for": team_row.get("all", {}).get("goals", {}).get("for"),
-                        "goals_against": team_row.get("all", {}).get("goals", {}).get("against")
+                        "goals_against": team_row.get("all", {}).get("goals", {}).get("against"),
                     }
     return None
 
@@ -276,7 +276,7 @@ def extract_odds_summary(odds_response):
         return {
             "bookmaker_name": None,
             "match_winner": None,
-            "markets_preview": []
+            "markets_preview": [],
         }
 
     first_fixture = odds_response[0]
@@ -285,7 +285,7 @@ def extract_odds_summary(odds_response):
         return {
             "bookmaker_name": None,
             "match_winner": None,
-            "markets_preview": []
+            "markets_preview": [],
         }
 
     bookmaker = bookmakers[0]
@@ -301,19 +301,19 @@ def extract_odds_summary(odds_response):
 
         preview.append({
             "bet_name": bet_name,
-            "values": values[:4]
+            "values": values[:4],
         })
 
         if bet_name and bet_name.lower() in ["match winner", "winner", "1x2"]:
             match_winner = {
                 "bet_name": bet_name,
-                "values": values
+                "values": values,
             }
 
     return {
         "bookmaker_name": bookmaker_name,
         "match_winner": match_winner,
-        "markets_preview": preview[:5]
+        "markets_preview": preview[:8],
     }
 
 
@@ -333,9 +333,11 @@ def extract_match_winner_odds(match_winner_market):
 
 
 def find_market_values(markets_preview, market_names, accepted_labels=None):
+    target_names = [m.lower() for m in market_names]
+
     for market in markets_preview:
         bet_name = (market.get("bet_name") or "").lower()
-        if bet_name in [m.lower() for m in market_names]:
+        if bet_name in target_names:
             values = market.get("values", [])
             extracted = {}
             for item in values:
@@ -345,7 +347,7 @@ def find_market_values(markets_preview, market_names, accepted_labels=None):
                     extracted[label] = odd
             return {
                 "bet_name": market.get("bet_name"),
-                "values": extracted
+                "values": extracted,
             }
     return None
 
@@ -429,7 +431,7 @@ def build_value_decision(context, normalized_probs):
             "decision": decision,
             "model_score_home": home_score,
             "model_score_away": away_score,
-            "rationale": rationale
+            "rationale": rationale,
         }
 
     market_gap = abs(p_home - p_away)
@@ -454,7 +456,7 @@ def build_value_decision(context, normalized_probs):
         "decision": decision,
         "model_score_home": home_score,
         "model_score_away": away_score,
-        "rationale": rationale
+        "rationale": rationale,
     }
 
 
@@ -504,76 +506,67 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
     if away_ga_avg is not None and away_ga_avg >= 1.15:
         concede_signal += 1
 
-    home_form = goals_context["home_form"] or ""
-    away_form = goals_context["away_form"] or ""
-
-    # BTTS
     if btts_market:
         yes_odd = btts_market["values"].get("Yes")
         no_odd = btts_market["values"].get("No")
 
         if yes_odd and no_odd:
-            if attack_signal >= 2 and concede_signal >= 1:
-                if float(yes_odd) >= 1.60:
-                    decision = "LEAN_BTTS_YES"
-                    rationale.append("Les deux équipes affichent des signaux offensifs suffisants.")
-                    rationale.append("Les profils défensifs ne ferment pas naturellement le match.")
-                    return {
-                        "decision": decision,
-                        "rationale": rationale,
-                        "home_gf_avg": home_gf_avg,
-                        "away_gf_avg": away_gf_avg,
-                        "home_ga_avg": home_ga_avg,
-                        "away_ga_avg": away_ga_avg
-                    }
+            if attack_signal >= 2 and concede_signal >= 1 and float(yes_odd) >= 1.60:
+                decision = "LEAN_BTTS_YES"
+                rationale.append("Les deux équipes affichent des signaux offensifs suffisants.")
+                rationale.append("Les profils défensifs ne ferment pas naturellement le match.")
+                return {
+                    "decision": decision,
+                    "rationale": rationale,
+                    "home_gf_avg": home_gf_avg,
+                    "away_gf_avg": away_gf_avg,
+                    "home_ga_avg": home_ga_avg,
+                    "away_ga_avg": away_ga_avg,
+                }
 
-            if attack_signal <= 1 and concede_signal <= 1:
-                if float(no_odd) >= 1.60:
-                    decision = "LEAN_BTTS_NO"
-                    rationale.append("Le profil global ne pousse pas clairement vers deux équipes buteuses.")
-                    rationale.append("Signaux offensifs insuffisants pour un BTTS fort.")
-                    return {
-                        "decision": decision,
-                        "rationale": rationale,
-                        "home_gf_avg": home_gf_avg,
-                        "away_gf_avg": away_gf_avg,
-                        "home_ga_avg": home_ga_avg,
-                        "away_ga_avg": away_ga_avg
-                    }
+            if attack_signal <= 1 and concede_signal <= 1 and float(no_odd) >= 1.60:
+                decision = "LEAN_BTTS_NO"
+                rationale.append("Le profil global ne pousse pas clairement vers deux équipes buteuses.")
+                rationale.append("Signaux offensifs insuffisants pour un BTTS fort.")
+                return {
+                    "decision": decision,
+                    "rationale": rationale,
+                    "home_gf_avg": home_gf_avg,
+                    "away_gf_avg": away_gf_avg,
+                    "home_ga_avg": home_ga_avg,
+                    "away_ga_avg": away_ga_avg,
+                }
 
-    # OVER/UNDER 2.5
     if ou25_market:
         over_odd = ou25_market["values"].get("Over 2.5")
         under_odd = ou25_market["values"].get("Under 2.5")
 
         if over_odd and under_odd:
-            if attack_signal >= 2 and concede_signal >= 2:
-                if float(over_odd) >= 1.70:
-                    decision = "LEAN_OVER_2_5"
-                    rationale.append("Les moyennes offensives et défensives suggèrent un match ouvert.")
-                    rationale.append("Le profil global pousse vers 3 buts ou plus.")
-                    return {
-                        "decision": decision,
-                        "rationale": rationale,
-                        "home_gf_avg": home_gf_avg,
-                        "away_gf_avg": away_gf_avg,
-                        "home_ga_avg": home_ga_avg,
-                        "away_ga_avg": away_ga_avg
-                    }
+            if attack_signal >= 2 and concede_signal >= 2 and float(over_odd) >= 1.70:
+                decision = "LEAN_OVER_2_5"
+                rationale.append("Les moyennes offensives et défensives suggèrent un match ouvert.")
+                rationale.append("Le profil global pousse vers 3 buts ou plus.")
+                return {
+                    "decision": decision,
+                    "rationale": rationale,
+                    "home_gf_avg": home_gf_avg,
+                    "away_gf_avg": away_gf_avg,
+                    "home_ga_avg": home_ga_avg,
+                    "away_ga_avg": away_ga_avg,
+                }
 
-            if attack_signal <= 1 and concede_signal <= 1:
-                if float(under_odd) >= 1.70:
-                    decision = "LEAN_UNDER_2_5"
-                    rationale.append("Le profil statistique ne soutient pas un match très ouvert.")
-                    rationale.append("Peu de signaux combinés pour dépasser 2.5 buts.")
-                    return {
-                        "decision": decision,
-                        "rationale": rationale,
-                        "home_gf_avg": home_gf_avg,
-                        "away_gf_avg": away_gf_avg,
-                        "home_ga_avg": home_ga_avg,
-                        "away_ga_avg": away_ga_avg
-                    }
+            if attack_signal <= 1 and concede_signal <= 1 and float(under_odd) >= 1.70:
+                decision = "LEAN_UNDER_2_5"
+                rationale.append("Le profil statistique ne soutient pas un match très ouvert.")
+                rationale.append("Peu de signaux combinés pour dépasser 2.5 buts.")
+                return {
+                    "decision": decision,
+                    "rationale": rationale,
+                    "home_gf_avg": home_gf_avg,
+                    "away_gf_avg": away_gf_avg,
+                    "home_ga_avg": home_ga_avg,
+                    "away_ga_avg": away_ga_avg,
+                }
 
     rationale.append("Les marchés buts ne montrent pas d'avantage exploitable suffisant.")
     rationale.append("Discipline : NO_BET.")
@@ -583,7 +576,7 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
         "home_gf_avg": home_gf_avg,
         "away_gf_avg": away_gf_avg,
         "home_ga_avg": home_ga_avg,
-        "away_ga_avg": away_ga_avg
+        "away_ga_avg": away_ga_avg,
     }
 
 
@@ -610,13 +603,47 @@ def health():
     })
 
 
+@app.route("/fixtures-prematch-ready")
+def fixtures_prematch_ready():
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    data, status_code = call_api_football("fixtures", {"date": today})
+
+    if status_code != 200:
+        return jsonify(data), status_code
+
+    fixtures = data["data"].get("response", [])
+
+    prematch = [
+        m for m in fixtures
+        if is_priority_fixture(m)
+        and is_target_league_by_id(m)
+        and is_pre_match_fixture(m)
+    ]
+
+    structured = [build_fixture_record(m) for m in prematch]
+    selected = structured[:5]
+
+    lines = [
+        f"{format_match_time(m['kickoff_utc'])} | {m['home']} vs {m['away']} | {m['league_name']} | id={m['fixture_id']}"
+        for m in selected
+    ]
+
+    if lines:
+        send_telegram_message("PREMATCH:\n\n" + "\n".join(lines))
+
+    return jsonify({
+        "status": "ok",
+        "count": len(structured),
+        "sample": selected,
+    }), 200
+
+
 @app.route("/fixture-value")
 def fixture_value():
     fixture_id = request.args.get("fixture_id", "").strip()
 
     if not fixture_id:
         return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-
     if not fixture_id.isdigit():
         return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
 
@@ -643,7 +670,7 @@ def fixture_value():
             "decision": "NO_BET",
             "message": "Fixture is not pre-match anymore",
             "telegram_status": telegram_data,
-            "telegram_http_status": telegram_status
+            "telegram_http_status": telegram_status,
         }), 200
 
     teams = build_fixture_teams_info(match)
@@ -669,7 +696,7 @@ def fixture_value():
         "home_goals_for": home_standing["goals_for"] if home_standing else None,
         "home_goals_against": home_standing["goals_against"] if home_standing else None,
         "away_goals_for": away_standing["goals_for"] if away_standing else None,
-        "away_goals_against": away_standing["goals_against"] if away_standing else None
+        "away_goals_against": away_standing["goals_against"] if away_standing else None,
     }
 
     odds_data, odds_status = call_api_football("odds", {"fixture": fixture_id})
@@ -682,7 +709,7 @@ def fixture_value():
             "status": "ok",
             "fixture": detail,
             "decision": "NO_BET",
-            "message": "No odds found for this fixture"
+            "message": "No odds found for this fixture",
         }), 200
 
     odds_summary = extract_odds_summary(odds_response)
@@ -693,7 +720,7 @@ def fixture_value():
             "status": "ok",
             "fixture": detail,
             "decision": "NO_BET",
-            "message": "No 1X2 market found for this fixture"
+            "message": "No 1X2 market found for this fixture",
         }), 200
 
     odds_1x2 = extract_match_winner_odds(match_winner_market)
@@ -702,16 +729,14 @@ def fixture_value():
             "status": "ok",
             "fixture": detail,
             "decision": "NO_BET",
-            "message": "Could not extract 1X2 odds"
+            "message": "Could not extract 1X2 odds",
         }), 200
-
 
     implied = {
         "Home": implied_probability(odds_1x2["Home"]),
         "Draw": implied_probability(odds_1x2["Draw"]),
-        "Away": implied_probability(odds_1x2["Away"])
+        "Away": implied_probability(odds_1x2["Away"]),
     }
-
     normalized = normalize_probabilities(implied)
     decision_data = build_value_decision(context, normalized)
 
@@ -745,7 +770,7 @@ def fixture_value():
         "model_score_away": decision_data["model_score_away"],
         "rationale": decision_data["rationale"],
         "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status
+        "telegram_http_status": telegram_status,
     }), 200
 
 
@@ -755,7 +780,6 @@ def fixture_goals_value():
 
     if not fixture_id:
         return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-
     if not fixture_id.isdigit():
         return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
 
@@ -782,7 +806,7 @@ def fixture_goals_value():
             "decision": "NO_BET",
             "message": "Fixture is not pre-match anymore",
             "telegram_status": telegram_data,
-            "telegram_http_status": telegram_status
+            "telegram_http_status": telegram_status,
         }), 200
 
     teams = build_fixture_teams_info(match)
@@ -810,7 +834,7 @@ def fixture_goals_value():
             "status": "ok",
             "fixture": detail,
             "decision": "NO_BET",
-            "message": "No odds found for this fixture"
+            "message": "No odds found for this fixture",
         }), 200
 
     odds_summary = extract_odds_summary(odds_response)
@@ -819,16 +843,16 @@ def fixture_goals_value():
     btts_market = find_market_values(
         markets_preview,
         ["Both Teams Score", "Both Teams To Score"],
-        accepted_labels=["Yes", "No"]
+        accepted_labels=["Yes", "No"],
     )
 
     ou25_market = find_market_values(
         markets_preview,
         ["Goals Over/Under", "Over/Under"],
-        accepted_labels=["Over 2.5", "Under 2.5"]
+        accepted_labels=["Over 2.5", "Under 2.5"],
     )
 
-decision_data = build_goals_value_decision(goals_context, btts_market, ou25_market)
+    decision_data = build_goals_value_decision(goals_context, btts_market, ou25_market)
 
     message = (
         "GOALS VALUE ANALYSIS\n\n"
@@ -860,7 +884,7 @@ decision_data = build_goals_value_decision(goals_context, btts_market, ou25_mark
         "home_ga_avg": decision_data["home_ga_avg"],
         "away_ga_avg": decision_data["away_ga_avg"],
         "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status
+        "telegram_http_status": telegram_status,
     }), 200
 
 
@@ -870,7 +894,6 @@ def debug_fixture_value():
 
     if not fixture_id:
         return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-
     if not fixture_id.isdigit():
         return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
 
@@ -881,7 +904,7 @@ def debug_fixture_value():
     debug["fixture_data_keys"] = list(fixture_data.keys())
 
     if fixture_status != 200:
-        return jsonify(debug), 200
+        return jsonify({"status": "ok", "debug": debug}), 200
 
     match = fixture_data["fixture"]
     detail = build_fixture_detail_summary(match)
@@ -928,10 +951,10 @@ def debug_fixture_value():
 
     return jsonify({
         "status": "ok",
-        "debug": debug
+        "debug": debug,
     }), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-    
