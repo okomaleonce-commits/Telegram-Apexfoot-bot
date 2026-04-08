@@ -19,16 +19,70 @@ EXCLUDED_KEYWORDS = [
 ]
 
 TARGET_LEAGUE_IDS = [
-    39,   # Premier League (England)
-    140,  # La Liga (Spain)
-    78,   # Bundesliga (Germany)
-    135,  # Serie A (Italy)
-    61,   # Ligue 1 (France)
-    40,   # Championship (England)
-    71,   # Serie A (Brazil)
-    128,  # Liga Profesional Argentina
-    242,  # Liga Pro (Ecuador)
-    265,  # Primera División (Chile)
+    # Europe - Top
+    39,   # Premier League
+    40,   # Championship
+    41,   # League One
+    140,  # La Liga
+    141,  # La Liga 2
+    78,   # Bundesliga
+    79,   # 2. Bundesliga
+    135,  # Serie A
+    136,  # Serie B
+    61,   # Ligue 1
+    62,   # Ligue 2
+
+    # Europe - compétitions UEFA
+    2,    # Champions League
+    3,    # Europa League
+    848,  # Europa Conference League
+
+    # Autres Europe
+    94,   # Portugal Liga NOS
+    95,   # Portugal LigaPro
+    88,   # Netherlands Eredivisie
+    89,   # Netherlands Eerste Divisie
+    203,  # Turkey Süper Lig
+    197,  # Greece Super League
+    207,  # Switzerland Super League
+    113,  # Denmark Superliga
+    119,  # Sweden Allsvenskan
+    103,  # Norway Eliteserien
+    106,  # Poland Ekstraklasa
+    179,  # Romania Liga I
+    218,  # Hungary NB I
+    235,  # Russia Premier League
+    72,   # Scotland Premiership
+    210,  # Croatia Prva HNL
+    328,  # Ukraine Premier League
+    244,  # Finland Veikkausliiga
+    164,  # Iceland Úrvalsdeild
+
+    # Amérique
+    128,  # Argentina Primera División
+    71,   # Brazil Serie A
+    239,  # Colombia Primera A
+    265,  # Chile Primera División
+    262,  # Liga MX
+    253,  # MLS
+
+    # Afrique
+    233,  # Egypt Premier League
+    242,  # Morocco Botola
+    343,  # Ivory Coast Ligue 1
+
+    # Asie / Moyen-Orient
+    292,  # Saudi Pro League
+    307,  # UAE League (optionnel si utile)
+    301,  # China Super League
+    98,   # Japan J1 League
+    292,  # Saudi League
+    292,  # (doublon toléré mais inutile)
+    307,  # Korea K League 1
+    17,   # AFC Champions League
+
+    # Océanie
+    188,  # Australia A-League
 ]
 
 
