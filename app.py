@@ -19,70 +19,53 @@ EXCLUDED_KEYWORDS = [
 ]
 
 TARGET_LEAGUE_IDS = [
-    # Europe - Top
-    39,   # Premier League
-    40,   # Championship
-    41,   # League One
-    140,  # La Liga
-    141,  # La Liga 2
-    78,   # Bundesliga
-    79,   # 2. Bundesliga
-    135,  # Serie A
-    136,  # Serie B
-    61,   # Ligue 1
-    62,   # Ligue 2
-
-    # Europe - compétitions UEFA
-    2,    # Champions League
-    3,    # Europa League
-    848,  # Europa Conference League
-
-    # Autres Europe
-    94,   # Portugal Liga NOS
-    95,   # Portugal LigaPro
-    88,   # Netherlands Eredivisie
-    89,   # Netherlands Eerste Divisie
-    203,  # Turkey Süper Lig
-    197,  # Greece Super League
-    207,  # Switzerland Super League
-    113,  # Denmark Superliga
-    119,  # Sweden Allsvenskan
-    103,  # Norway Eliteserien
-    106,  # Poland Ekstraklasa
-    179,  # Romania Liga I
-    218,  # Hungary NB I
-    235,  # Russia Premier League
-    72,   # Scotland Premiership
-    210,  # Croatia Prva HNL
-    328,  # Ukraine Premier League
-    244,  # Finland Veikkausliiga
-    164,  # Iceland Úrvalsdeild
-
-    # Amérique
-    128,  # Argentina Primera División
-    71,   # Brazil Serie A
-    239,  # Colombia Primera A
-    265,  # Chile Primera División
-    262,  # Liga MX
-    253,  # MLS
-
-    # Afrique
-    233,  # Egypt Premier League
-    242,  # Morocco Botola
-    343,  # Ivory Coast Ligue 1
-
-    # Asie / Moyen-Orient
-    292,  # Saudi Pro League
-    307,  # UAE League (optionnel si utile)
-    301,  # China Super League
-    98,   # Japan J1 League
-    292,  # Saudi League
-    292,  # (doublon toléré mais inutile)
-    307,  # Korea K League 1
+    39,   # England - Premier League
+    40,   # England - Championship
+    41,   # England - League One
+    140,  # Spain - La Liga
+    78,   # Germany - Bundesliga
+    79,   # Germany - 2. Bundesliga
+    135,  # Italy - Serie A
+    136,  # Italy - Serie B
+    61,   # France - Ligue 1
+    62,   # France - Ligue 2
+    2,    # UEFA Champions League
+    3,    # UEFA Europa League
+    848,  # UEFA Europa Conference League
+    94,   # Portugal - Primeira Liga
+    95,   # Portugal - Liga Portugal 2
+    88,   # Netherlands - Eredivisie
+    89,   # Netherlands - Eerste Divisie
+    203,  # Turkey - Süper Lig
+    197,  # Greece - Super League 1
+    207,  # Switzerland - Super League
+    113,  # Denmark - Superliga
+    119,  # Sweden - Allsvenskan
+    103,  # Norway - Eliteserien
+    106,  # Poland - Ekstraklasa
+    179,  # Romania - Liga I
+    218,  # Hungary - NB I
+    235,  # Russia - Premier League
+    72,   # Scotland - Premiership
+    210,  # Croatia - HNL
+    328,  # Ukraine - Premier League
+    244,  # Finland - Veikkausliiga
+    164,  # Iceland - Úrvalsdeild
+    128,  # Argentina - Primera División
+    71,   # Brazil - Serie A
+    239,  # Colombia - Primera A
+    265,  # Chile - Primera División
+    262,  # Mexico - Liga MX
+    253,  # USA - MLS
+    233,  # Egypt - Premier League
+    242,  # Morocco - Botola Pro
+    343,  # Ivory Coast - Ligue 1
+    307,  # Saudi Arabia - Pro League
+    301,  # China - Super League
+    98,   # Japan - J1 League
+    292,  # South Korea - K League 1
     17,   # AFC Champions League
-
-    # Océanie
-    188,  # Australia A-League
+    188,  # Australia - A-League
 ]
 
 
@@ -91,7 +74,7 @@ def handle_exception(e):
     return jsonify({
         "status": "error",
         "message": "Unhandled server exception",
-        "details": str(e)
+        "details": str(e),
     }), 500
 
 
@@ -110,21 +93,21 @@ def send_telegram_message(text: str):
         response = requests.post(
             url,
             json={"chat_id": CHAT_ID, "text": text},
-            timeout=15
+            timeout=15,
         )
         data = response.json()
     except Exception as e:
         return {
             "status": "error",
             "message": "Telegram request failed",
-            "details": str(e)
+            "details": str(e),
         }, 500
 
     if not response.ok or not data.get("ok"):
         return {
             "status": "error",
             "message": "Telegram API returned an error",
-            "telegram_response": data
+            "telegram_response": data,
         }, 500
 
     return {"status": "ok", "telegram_response": data}, 200
@@ -145,14 +128,14 @@ def call_api_football(endpoint: str, params=None):
             url,
             headers=headers,
             params=params or {},
-            timeout=20
+            timeout=20,
         )
         data = response.json()
     except Exception as e:
         return {
             "status": "error",
             "message": "API-Football request failed",
-            "details": str(e)
+            "details": str(e),
         }, 500
 
     if not response.ok:
@@ -160,7 +143,7 @@ def call_api_football(endpoint: str, params=None):
             "status": "error",
             "message": "API-Football returned an HTTP error",
             "http_status": response.status_code,
-            "api_response": data
+            "api_response": data,
         }, 500
 
     return {"status": "ok", "data": data}, 200
@@ -217,20 +200,12 @@ def build_fixture_detail(match):
     fixture = match.get("fixture", {})
     league = match.get("league", {})
     teams = match.get("teams", {})
-    goals = match.get("goals", {})
-    score = match.get("score", {})
 
     return {
         "fixture_id": fixture.get("id"),
-        "referee": fixture.get("referee"),
-        "timezone": fixture.get("timezone"),
         "date": fixture.get("date"),
-        "timestamp": fixture.get("timestamp"),
-        "venue_name": fixture.get("venue", {}).get("name"),
-        "venue_city": fixture.get("venue", {}).get("city"),
         "status_long": fixture.get("status", {}).get("long"),
         "status_short": fixture.get("status", {}).get("short"),
-        "elapsed": fixture.get("status", {}).get("elapsed"),
         "league_id": league.get("id"),
         "league_name": league.get("name"),
         "country": league.get("country"),
@@ -238,14 +213,6 @@ def build_fixture_detail(match):
         "round": league.get("round"),
         "home": teams.get("home", {}).get("name"),
         "away": teams.get("away", {}).get("name"),
-        "home_winner": teams.get("home", {}).get("winner"),
-        "away_winner": teams.get("away", {}).get("winner"),
-        "goals_home": goals.get("home"),
-        "goals_away": goals.get("away"),
-        "halftime_home": score.get("halftime", {}).get("home"),
-        "halftime_away": score.get("halftime", {}).get("away"),
-        "fulltime_home": score.get("fulltime", {}).get("home"),
-        "fulltime_away": score.get("fulltime", {}).get("away"),
     }
 
 
@@ -266,23 +233,6 @@ def build_fixture_teams_info(match):
     }
 
 
-def build_fixture_detail_summary(match):
-    detail = build_fixture_detail(match)
-    return {
-        "fixture_id": detail["fixture_id"],
-        "home": detail["home"],
-        "away": detail["away"],
-        "league_id": detail["league_id"],
-        "league_name": detail["league_name"],
-        "country": detail["country"],
-        "season": detail["season"],
-        "round": detail["round"],
-        "date": detail["date"],
-        "status_short": detail["status_short"],
-        "status_long": detail["status_long"],
-    }
-
-
 def get_fixture_by_id(fixture_id):
     data, status_code = call_api_football("fixtures", {"id": fixture_id})
 
@@ -293,7 +243,7 @@ def get_fixture_by_id(fixture_id):
     if not response:
         return {
             "status": "error",
-            "message": f"No fixture found for fixture_id={fixture_id}"
+            "message": f"No fixture found for fixture_id={fixture_id}",
         }, 404
 
     return {"status": "ok", "fixture": response[0]}, 200
@@ -310,11 +260,7 @@ def find_team_standing(standings_response, team_id):
                         "team_id": team_row.get("team", {}).get("id"),
                         "team_name": team_row.get("team", {}).get("name"),
                         "points": team_row.get("points"),
-                        "goals_diff": team_row.get("goalsDiff"),
-                        "group": team_row.get("group"),
                         "form": team_row.get("form"),
-                        "status": team_row.get("status"),
-                        "description": team_row.get("description"),
                         "played": team_row.get("all", {}).get("played"),
                         "win": team_row.get("all", {}).get("win"),
                         "draw": team_row.get("all", {}).get("draw"),
@@ -355,7 +301,7 @@ def extract_odds_summary(odds_response):
 
         preview.append({
             "bet_name": bet_name,
-            "values": values[:4],
+            "values": values[:6],
         })
 
         if bet_name and bet_name.lower() in ["match winner", "winner", "1x2"]:
@@ -367,7 +313,7 @@ def extract_odds_summary(odds_response):
     return {
         "bookmaker_name": bookmaker_name,
         "match_winner": match_winner,
-        "markets_preview": preview[:8],
+        "markets_preview": preview[:10],
     }
 
 
@@ -413,7 +359,7 @@ def implied_probability(decimal_odd):
         odd = float(decimal_odd)
         if odd <= 0:
             return None
-        return 1 / odd
+        return 1.0 / odd
     except Exception:
         return None
 
@@ -437,80 +383,204 @@ def count_wins(form_string):
     return form_string.count("W")
 
 
-def build_value_decision(context, normalized_probs):
-    home_score = 0
-    away_score = 0
+def safe_div(a, b):
+    if a is None or b in (None, 0):
+        return None
+    return a / b
 
-    if context["home_rank"] is not None and context["away_rank"] is not None:
-        if context["home_rank"] < context["away_rank"]:
-            home_score += 1
-        elif context["away_rank"] < context["home_rank"]:
-            away_score += 1
 
-    if context["home_points"] is not None and context["away_points"] is not None:
-        if context["home_points"] > context["away_points"]:
-            home_score += 1
-        elif context["away_points"] > context["home_points"]:
-            away_score += 1
+def avg_goals_for(goals_for, played):
+    return safe_div(goals_for, played)
 
-    home_wins = count_wins(context["home_form"])
-    away_wins = count_wins(context["away_form"])
-    if home_wins > away_wins:
-        home_score += 1
-    elif away_wins > home_wins:
-        away_score += 1
 
-    if context["home_goals_against"] is not None and context["away_goals_against"] is not None:
-        if context["home_goals_against"] < context["away_goals_against"]:
-            home_score += 1
-        elif context["away_goals_against"] < context["home_goals_against"]:
-            away_score += 1
+def avg_goals_against(goals_against, played):
+    return safe_div(goals_against, played)
 
-    if context["home_goals_for"] is not None and context["away_goals_for"] is not None:
-        if context["home_goals_for"] > context["away_goals_for"]:
-            home_score += 1
-        elif context["away_goals_for"] > context["home_goals_for"]:
-            away_score += 1
 
-    p_home = normalized_probs.get("Home")
-    p_draw = normalized_probs.get("Draw")
-    p_away = normalized_probs.get("Away")
+def build_model_probabilities(context):
+    """
+    Modèle simple et prudent.
+    Produit des probabilités maison grossières pour comparer au marché.
+    """
+    home_score = 0.0
+    away_score = 0.0
+    draw_score = 0.0
 
-    decision = "NO_BET"
-    rationale = []
+    home_rank = context.get("home_rank")
+    away_rank = context.get("away_rank")
+    home_points = context.get("home_points")
+    away_points = context.get("away_points")
+    home_form = context.get("home_form") or ""
+    away_form = context.get("away_form") or ""
+    home_goals_for = context.get("home_goals_for")
+    away_goals_for = context.get("away_goals_for")
+    home_goals_against = context.get("home_goals_against")
+    away_goals_against = context.get("away_goals_against")
 
-    if p_home is None or p_draw is None or p_away is None:
-        rationale.append("Probabilités de marché incomplètes.")
-        return {
-            "decision": decision,
-            "model_score_home": home_score,
-            "model_score_away": away_score,
-            "rationale": rationale,
-        }
+    # Base
+    home_score += 1.0
+    away_score += 1.0
+    draw_score += 0.80
 
-    market_gap = abs(p_home - p_away)
+    # Classement
+    if home_rank is not None and away_rank is not None:
+        rank_gap = away_rank - home_rank
+        if rank_gap >= 4:
+            home_score += 0.45
+        elif rank_gap >= 2:
+            home_score += 0.25
+        elif rank_gap <= -4:
+            away_score += 0.45
+        elif rank_gap <= -2:
+            away_score += 0.25
+        else:
+            draw_score += 0.20
 
-    if home_score >= away_score + 2 and p_home >= p_away + 0.03:
-        decision = "LEAN_HOME"
-        rationale.append("Le contexte favorise clairement l'équipe à domicile.")
-        rationale.append("Le marché va aussi légèrement dans le même sens.")
-    elif away_score >= home_score + 2 and p_away >= p_home + 0.03:
-        decision = "LEAN_AWAY"
-        rationale.append("Le contexte favorise clairement l'équipe à l'extérieur.")
-        rationale.append("Le marché va aussi légèrement dans le même sens.")
-    elif market_gap < 0.02 and abs(home_score - away_score) <= 1:
-        decision = "LEAN_DRAW"
-        rationale.append("Le marché voit un match quasi équilibré.")
-        rationale.append("Le contexte ne crée pas d'écart structurel fort.")
+    # Points
+    if home_points is not None and away_points is not None:
+        point_gap = home_points - away_points
+        if point_gap >= 8:
+            home_score += 0.35
+        elif point_gap >= 3:
+            home_score += 0.20
+        elif point_gap <= -8:
+            away_score += 0.35
+        elif point_gap <= -3:
+            away_score += 0.20
+        else:
+            draw_score += 0.10
+
+    # Forme
+    home_wins = count_wins(home_form)
+    away_wins = count_wins(away_form)
+    if home_wins >= away_wins + 2:
+        home_score += 0.30
+    elif away_wins >= home_wins + 2:
+        away_score += 0.30
     else:
-        rationale.append("Le contexte et le marché ne créent pas d'écart suffisamment exploitable.")
-        rationale.append("Absence de signal clair -> discipline NO_BET.")
+        draw_score += 0.10
+
+    # Attaque
+    if home_goals_for is not None and away_goals_for is not None:
+        if home_goals_for >= away_goals_for + 8:
+            home_score += 0.20
+        elif away_goals_for >= home_goals_for + 8:
+            away_score += 0.20
+
+    # Défense
+    if home_goals_against is not None and away_goals_against is not None:
+        if away_goals_against >= home_goals_against + 8:
+            home_score += 0.20
+        elif home_goals_against >= away_goals_against + 8:
+            away_score += 0.20
+
+    raw = {"Home": home_score, "Draw": draw_score, "Away": away_score}
+    total = sum(raw.values())
+    normalized = {k: v / total for k, v in raw.items()}
 
     return {
-        "decision": decision,
-        "model_score_home": home_score,
-        "model_score_away": away_score,
-        "rationale": rationale,
+        "raw_scores": raw,
+        "normalized_probabilities": normalized,
+    }
+
+
+def compute_edges(model_probs, market_probs):
+    result = {}
+    for key in ["Home", "Draw", "Away"]:
+        mp = model_probs.get(key)
+        bp = market_probs.get(key)
+        result[key] = None if mp is None or bp is None else mp - bp
+    return result
+
+
+def best_edge(edges):
+    candidates = {k: v for k, v in edges.items() if v is not None}
+    if not candidates:
+        return None, None
+    best_key = max(candidates, key=candidates.get)
+    return best_key, candidates[best_key]
+
+
+def build_value_decision_with_edge(
+    detail,
+    context,
+    odds_1x2,
+    market_probs,
+    model_probs,
+    edges,
+):
+    status_short = detail.get("status_short")
+    if is_live_or_not_prematch(status_short):
+        return {
+            "decision": "NO_BET",
+            "rationale": ["Le match n'est plus en pré-match."],
+            "best_edge_label": None,
+            "best_edge_value": None,
+            "blocked": True,
+        }
+
+    # Cotes trop faibles = on bloque
+    try:
+        away_odd = float(odds_1x2["Away"]) if odds_1x2.get("Away") else None
+        home_odd = float(odds_1x2["Home"]) if odds_1x2.get("Home") else None
+    except Exception:
+        away_odd = None
+        home_odd = None
+
+    if away_odd is not None and away_odd < 1.60:
+        return {
+            "decision": "NO_BET",
+            "rationale": ["Cote away trop basse (< 1.60) : risque de favori surpayé."],
+            "best_edge_label": None,
+            "best_edge_value": None,
+            "blocked": True,
+        }
+
+    if home_odd is not None and home_odd < 1.60:
+        return {
+            "decision": "NO_BET",
+            "rationale": ["Cote home trop basse (< 1.60) : risque de favori surpayé."],
+            "best_edge_label": None,
+            "best_edge_value": None,
+            "blocked": True,
+        }
+
+    edge_label, edge_value = best_edge(edges)
+
+    if edge_label is None or edge_value is None:
+        return {
+            "decision": "NO_BET",
+            "rationale": ["Impossible de calculer un edge exploitable."],
+            "best_edge_label": edge_label,
+            "best_edge_value": edge_value,
+            "blocked": False,
+        }
+
+    # Seuil minimum d'edge
+    if edge_value < 0.05:
+        return {
+            "decision": "NO_BET",
+            "rationale": ["Best edge < 5% : pas d'avantage suffisant contre le marché."],
+            "best_edge_label": edge_label,
+            "best_edge_value": edge_value,
+            "blocked": False,
+        }
+
+    label_to_decision = {
+        "Home": "VALUE_HOME",
+        "Draw": "VALUE_DRAW",
+        "Away": "VALUE_AWAY",
+    }
+
+    return {
+        "decision": label_to_decision.get(edge_label, "NO_BET"),
+        "rationale": [
+            f"Edge positif sur {edge_label}.",
+            f"Best edge = {round(edge_value * 100, 2)}%.",
+        ],
+        "best_edge_label": edge_label,
+        "best_edge_value": edge_value,
+        "blocked": False,
     }
 
 
@@ -525,18 +595,6 @@ def build_goals_context(home_standing, away_standing):
         "home_played": home_standing["played"] if home_standing else None,
         "away_played": away_standing["played"] if away_standing else None,
     }
-
-
-def avg_goals_for(goals_for, played):
-    if goals_for is None or played in (None, 0):
-        return None
-    return goals_for / played
-
-
-def avg_goals_against(goals_against, played):
-    if goals_against is None or played in (None, 0):
-        return None
-    return goals_against / played
 
 
 def build_goals_value_decision(goals_context, btts_market, ou25_market):
@@ -565,62 +623,74 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
         no_odd = btts_market["values"].get("No")
 
         if yes_odd and no_odd:
-            if attack_signal >= 2 and concede_signal >= 1 and float(yes_odd) >= 1.60:
-                decision = "LEAN_BTTS_YES"
-                rationale.append("Les deux équipes affichent des signaux offensifs suffisants.")
-                rationale.append("Les profils défensifs ne ferment pas naturellement le match.")
-                return {
-                    "decision": decision,
-                    "rationale": rationale,
-                    "home_gf_avg": home_gf_avg,
-                    "away_gf_avg": away_gf_avg,
-                    "home_ga_avg": home_ga_avg,
-                    "away_ga_avg": away_ga_avg,
-                }
+            yes_prob = implied_probability(yes_odd)
+            no_prob = implied_probability(no_odd)
 
-            if attack_signal <= 1 and concede_signal <= 1 and float(no_odd) >= 1.60:
-                decision = "LEAN_BTTS_NO"
-                rationale.append("Le profil global ne pousse pas clairement vers deux équipes buteuses.")
-                rationale.append("Signaux offensifs insuffisants pour un BTTS fort.")
-                return {
-                    "decision": decision,
-                    "rationale": rationale,
-                    "home_gf_avg": home_gf_avg,
-                    "away_gf_avg": away_gf_avg,
-                    "home_ga_avg": home_ga_avg,
-                    "away_ga_avg": away_ga_avg,
-                }
+            if yes_prob is not None and no_prob is not None and abs(yes_prob - no_prob) < 0.05:
+                rationale.append("BTTS trop équilibré par le marché : NO_BET.")
+            else:
+                if attack_signal >= 2 and concede_signal >= 1 and float(yes_odd) >= 1.60:
+                    decision = "LEAN_BTTS_YES"
+                    rationale.append("Les deux équipes affichent des signaux offensifs suffisants.")
+                    rationale.append("Les profils défensifs ne ferment pas naturellement le match.")
+                    return {
+                        "decision": decision,
+                        "rationale": rationale,
+                        "home_gf_avg": home_gf_avg,
+                        "away_gf_avg": away_gf_avg,
+                        "home_ga_avg": home_ga_avg,
+                        "away_ga_avg": away_ga_avg,
+                    }
+
+                if attack_signal <= 1 and concede_signal <= 1 and float(no_odd) >= 1.60:
+                    decision = "LEAN_BTTS_NO"
+                    rationale.append("Le profil global ne pousse pas clairement vers deux équipes buteuses.")
+                    rationale.append("Signaux offensifs insuffisants pour un BTTS fort.")
+                    return {
+                        "decision": decision,
+                        "rationale": rationale,
+                        "home_gf_avg": home_gf_avg,
+                        "away_gf_avg": away_gf_avg,
+                        "home_ga_avg": home_ga_avg,
+                        "away_ga_avg": away_ga_avg,
+                    }
 
     if ou25_market:
         over_odd = ou25_market["values"].get("Over 2.5")
         under_odd = ou25_market["values"].get("Under 2.5")
 
         if over_odd and under_odd:
-            if attack_signal >= 2 and concede_signal >= 2 and float(over_odd) >= 1.70:
-                decision = "LEAN_OVER_2_5"
-                rationale.append("Les moyennes offensives et défensives suggèrent un match ouvert.")
-                rationale.append("Le profil global pousse vers 3 buts ou plus.")
-                return {
-                    "decision": decision,
-                    "rationale": rationale,
-                    "home_gf_avg": home_gf_avg,
-                    "away_gf_avg": away_gf_avg,
-                    "home_ga_avg": home_ga_avg,
-                    "away_ga_avg": away_ga_avg,
-                }
+            over_prob = implied_probability(over_odd)
+            under_prob = implied_probability(under_odd)
 
-            if attack_signal <= 1 and concede_signal <= 1 and float(under_odd) >= 1.70:
-                decision = "LEAN_UNDER_2_5"
-                rationale.append("Le profil statistique ne soutient pas un match très ouvert.")
-                rationale.append("Peu de signaux combinés pour dépasser 2.5 buts.")
-                return {
-                    "decision": decision,
-                    "rationale": rationale,
-                    "home_gf_avg": home_gf_avg,
-                    "away_gf_avg": away_gf_avg,
-                    "home_ga_avg": home_ga_avg,
-                    "away_ga_avg": away_ga_avg,
-                }
+            if over_prob is not None and under_prob is not None and abs(over_prob - under_prob) < 0.05:
+                rationale.append("O/U 2.5 trop équilibré par le marché : NO_BET.")
+            else:
+                if attack_signal >= 2 and concede_signal >= 2 and float(over_odd) >= 1.70:
+                    decision = "LEAN_OVER_2_5"
+                    rationale.append("Les moyennes offensives et défensives suggèrent un match ouvert.")
+                    rationale.append("Le profil global pousse vers 3 buts ou plus.")
+                    return {
+                        "decision": decision,
+                        "rationale": rationale,
+                        "home_gf_avg": home_gf_avg,
+                        "away_gf_avg": away_gf_avg,
+                        "home_ga_avg": home_ga_avg,
+                        "away_ga_avg": away_ga_avg,
+                    }
+
+                if attack_signal <= 1 and concede_signal <= 1 and float(under_odd) >= 1.70:
+                    decision = "LEAN_UNDER_2_5"
+                    rationale.append("Le profil statistique ne soutient pas un match très ouvert.")
+                    rationale.append("Peu de signaux combinés pour dépasser 2.5 buts.")
+                    return {
+                        "decision": decision,
+                        "rationale": rationale,
+                        "home_gf_avg": home_gf_avg,
+                        "away_gf_avg": away_gf_avg,
+                        "home_ga_avg": home_ga_avg,
+                        "away_ga_avg": away_ga_avg,
+                    }
 
     rationale.append("Les marchés buts ne montrent pas d'avantage exploitable suffisant.")
     rationale.append("Discipline : NO_BET.")
@@ -637,16 +707,6 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
 # =========================
 # ROUTES
 # =========================
-@app.route("/")
-def home():
-    return "Bot running"
-
-
-@app.route("/ping")
-def ping():
-    return jsonify({"status": "ok", "message": "pong"})
-
-
 @app.route("/health")
 def health():
     return jsonify({
@@ -786,13 +846,25 @@ def fixture_value():
             "message": "Could not extract 1X2 odds",
         }), 200
 
-    implied = {
+    market_implied_raw = {
         "Home": implied_probability(odds_1x2["Home"]),
         "Draw": implied_probability(odds_1x2["Draw"]),
         "Away": implied_probability(odds_1x2["Away"]),
     }
-    normalized = normalize_probabilities(implied)
-    decision_data = build_value_decision(context, normalized)
+    market_implied_normalized = normalize_probabilities(market_implied_raw)
+
+    model_data = build_model_probabilities(context)
+    model_probs = model_data["normalized_probabilities"]
+    edges = compute_edges(model_probs, market_implied_normalized)
+
+    decision_data = build_value_decision_with_edge(
+        detail=detail,
+        context=context,
+        odds_1x2=odds_1x2,
+        market_probs=market_implied_normalized,
+        model_probs=model_probs,
+        edges=edges,
+    )
 
     message = (
         "VALUE ANALYSIS\n\n"
@@ -801,11 +873,18 @@ def fixture_value():
         f"{format_match_time(detail['date'])}\n\n"
         f"Odds 1X2:\n"
         f"Home: {odds_1x2['Home']} | Draw: {odds_1x2['Draw']} | Away: {odds_1x2['Away']}\n\n"
-        f"Probabilités normalisées:\n"
-        f"Home: {round(normalized['Home'] * 100, 1) if normalized['Home'] is not None else 'N/A'}%\n"
-        f"Draw: {round(normalized['Draw'] * 100, 1) if normalized['Draw'] is not None else 'N/A'}%\n"
-        f"Away: {round(normalized['Away'] * 100, 1) if normalized['Away'] is not None else 'N/A'}%\n\n"
-        f"Model score: {decision_data['model_score_home']} - {decision_data['model_score_away']}\n"
+        f"Marché normalisé:\n"
+        f"Home: {round(market_implied_normalized['Home'] * 100, 1) if market_implied_normalized['Home'] is not None else 'N/A'}%\n"
+        f"Draw: {round(market_implied_normalized['Draw'] * 100, 1) if market_implied_normalized['Draw'] is not None else 'N/A'}%\n"
+        f"Away: {round(market_implied_normalized['Away'] * 100, 1) if market_implied_normalized['Away'] is not None else 'N/A'}%\n\n"
+        f"Modèle:\n"
+        f"Home: {round(model_probs['Home'] * 100, 1)}%\n"
+        f"Draw: {round(model_probs['Draw'] * 100, 1)}%\n"
+        f"Away: {round(model_probs['Away'] * 100, 1)}%\n\n"
+        f"Edges:\n"
+        f"Home: {round(edges['Home'] * 100, 2) if edges['Home'] is not None else 'N/A'}%\n"
+        f"Draw: {round(edges['Draw'] * 100, 2) if edges['Draw'] is not None else 'N/A'}%\n"
+        f"Away: {round(edges['Away'] * 100, 2) if edges['Away'] is not None else 'N/A'}%\n\n"
         f"Decision: {decision_data['decision']}\n"
         f"Rationale: {' | '.join(decision_data['rationale'])}"
     )
@@ -817,11 +896,14 @@ def fixture_value():
         "fixture": detail,
         "context": context,
         "odds_1x2": odds_1x2,
-        "implied_probabilities_raw": implied,
-        "implied_probabilities_normalized": normalized,
+        "market_implied_raw": market_implied_raw,
+        "market_implied_normalized": market_implied_normalized,
+        "model_probabilities": model_probs,
+        "model_raw_scores": model_data["raw_scores"],
+        "edges": edges,
+        "best_edge_label": decision_data["best_edge_label"],
+        "best_edge_value": decision_data["best_edge_value"],
         "decision": decision_data["decision"],
-        "model_score_home": decision_data["model_score_home"],
-        "model_score_away": decision_data["model_score_away"],
         "rationale": decision_data["rationale"],
         "telegram_status": telegram_data,
         "telegram_http_status": telegram_status,
