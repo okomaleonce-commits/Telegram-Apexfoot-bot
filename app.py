@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify, request
@@ -11,6 +12,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 API_KEY = os.environ.get("API_KEY")
 
 API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
+REQUEST_TIMEOUT = 20
 
 EXCLUDED_KEYWORDS = [
     "youth", "u17", "u18", "u19", "u20", "u21", "u23",
@@ -68,6 +70,35 @@ TARGET_LEAGUE_IDS = [
     188,  # Australia - A-League
 ]
 
+LEVELS_1X2 = {
+    1: {"name": "WATCHLIST", "edge_min": 0.03},
+    2: {"name": "VALUE", "edge_min": 0.05},
+    3: {"name": "MAIN", "edge_min": 0.08},
+}
+LEVELS_GOALS = {
+    1: {"name": "WATCHLIST", "confidence_min": 2},
+    2: {"name": "VALUE", "confidence_min": 3},
+    3: {"name": "MAIN", "confidence_min": 4},
+}
+
+MIN_ODD_HOME_AWAY = 1.60
+MIN_ODD_DRAW = 2.80
+MAX_ODD_MAIN_SIGNAL = 4.50
+MAX_SCAN_RESULTS = 20
+
+
+# =========================
+# GENERIC
+# =========================
+def ok(payload: Dict[str, Any], status_code: int = 200):
+    return jsonify(payload), status_code
+
+
+def err(message: str, status_code: int = 400, **kwargs):
+    payload = {"status": "error", "message": message}
+    payload.update(kwargs)
+    return jsonify(payload), status_code
+
 
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -81,7 +112,7 @@ def handle_exception(e):
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram_message(text: str):
+def send_telegram_message(text: str) -> Tuple[Dict[str, Any], int]:
     if not BOT_TOKEN:
         return {"status": "error", "message": "BOT_TOKEN is missing"}, 500
     if not CHAT_ID:
@@ -116,7 +147,7 @@ def send_telegram_message(text: str):
 # =========================
 # API FOOTBALL
 # =========================
-def call_api_football(endpoint: str, params=None):
+def call_api_football(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], int]:
     if not API_KEY:
         return {"status": "error", "message": "API_KEY is missing"}, 500
 
@@ -128,7 +159,7 @@ def call_api_football(endpoint: str, params=None):
             url,
             headers=headers,
             params=params or {},
-            timeout=20,
+            timeout=REQUEST_TIMEOUT,
         )
         data = response.json()
     except Exception as e:
@@ -152,51 +183,54 @@ def call_api_football(endpoint: str, params=None):
 # =========================
 # HELPERS
 # =========================
-def is_priority_fixture(match):
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_today_str() -> str:
+    return now_utc().strftime("%Y-%m-%d")
+
+
+def parse_iso_date(iso_date: Optional[str]) -> Optional[datetime]:
+    if not iso_date:
+        return None
+    try:
+        return datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def format_match_time(iso_date: Optional[str]) -> Optional[str]:
+    dt = parse_iso_date(iso_date)
+    if not dt:
+        return iso_date
+    return dt.astimezone(timezone.utc).strftime("%H:%M UTC")
+
+
+def is_priority_fixture(match: Dict[str, Any]) -> bool:
     text = (
-        match.get("league", {}).get("name", "").lower()
+        (match.get("league", {}).get("name") or "").lower()
         + " "
-        + match.get("teams", {}).get("home", {}).get("name", "").lower()
+        + (match.get("teams", {}).get("home", {}).get("name") or "").lower()
         + " "
-        + match.get("teams", {}).get("away", {}).get("name", "").lower()
+        + (match.get("teams", {}).get("away", {}).get("name") or "").lower()
     )
     return not any(keyword in text for keyword in EXCLUDED_KEYWORDS)
 
 
-def is_target_league_by_id(match):
+def is_target_league_by_id(match: Dict[str, Any]) -> bool:
     return match.get("league", {}).get("id") in TARGET_LEAGUE_IDS
 
 
-def is_pre_match_fixture(match):
+def is_pre_match_fixture(match: Dict[str, Any]) -> bool:
     return match.get("fixture", {}).get("status", {}).get("short") == "NS"
 
 
-def is_live_or_not_prematch(status_short):
+def is_live_or_not_prematch(status_short: Optional[str]) -> bool:
     return status_short != "NS"
 
 
-def format_match_time(iso_date: str):
-    try:
-        dt = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).strftime("%H:%M UTC")
-    except Exception:
-        return iso_date
-
-
-def build_fixture_record(match):
-    return {
-        "fixture_id": match.get("fixture", {}).get("id"),
-        "kickoff_utc": match.get("fixture", {}).get("date"),
-        "status": match.get("fixture", {}).get("status", {}).get("short"),
-        "league_id": match.get("league", {}).get("id"),
-        "league_name": match.get("league", {}).get("name"),
-        "country": match.get("league", {}).get("country"),
-        "home": match.get("teams", {}).get("home", {}).get("name"),
-        "away": match.get("teams", {}).get("away", {}).get("name"),
-    }
-
-
-def build_fixture_detail(match):
+def build_fixture_detail(match: Dict[str, Any]) -> Dict[str, Any]:
     fixture = match.get("fixture", {})
     league = match.get("league", {})
     teams = match.get("teams", {})
@@ -204,6 +238,7 @@ def build_fixture_detail(match):
     return {
         "fixture_id": fixture.get("id"),
         "date": fixture.get("date"),
+        "kickoff_utc": fixture.get("date"),
         "status_long": fixture.get("status", {}).get("long"),
         "status_short": fixture.get("status", {}).get("short"),
         "league_id": league.get("id"),
@@ -213,44 +248,12 @@ def build_fixture_detail(match):
         "round": league.get("round"),
         "home": teams.get("home", {}).get("name"),
         "away": teams.get("away", {}).get("name"),
-    }
-
-
-def build_fixture_detail_summary(match):
-    detail = build_fixture_detail(match)
-    return {
-        "fixture_id": detail["fixture_id"],
-        "home": detail["home"],
-        "away": detail["away"],
-        "league_id": detail["league_id"],
-        "league_name": detail["league_name"],
-        "country": detail["country"],
-        "season": detail["season"],
-        "round": detail["round"],
-        "date": detail["date"],
-        "status_short": detail["status_short"],
-        "status_long": detail["status_long"],
-    }
-
-
-def build_fixture_teams_info(match):
-    league = match.get("league", {})
-    teams = match.get("teams", {})
-
-    return {
-        "fixture_id": match.get("fixture", {}).get("id"),
-        "league_id": league.get("id"),
-        "league_name": league.get("name"),
-        "country": league.get("country"),
-        "season": league.get("season"),
         "home_team_id": teams.get("home", {}).get("id"),
-        "home_team_name": teams.get("home", {}).get("name"),
         "away_team_id": teams.get("away", {}).get("id"),
-        "away_team_name": teams.get("away", {}).get("name"),
     }
 
 
-def get_fixture_by_id(fixture_id):
+def get_fixture_by_id(fixture_id: str) -> Tuple[Dict[str, Any], int]:
     data, status_code = call_api_football("fixtures", {"id": fixture_id})
 
     if status_code != 200:
@@ -266,7 +269,15 @@ def get_fixture_by_id(fixture_id):
     return {"status": "ok", "fixture": response[0]}, 200
 
 
-def find_team_standing(standings_response, team_id):
+def get_fixtures_by_date(date_str: Optional[str] = None) -> Tuple[Dict[str, Any], int]:
+    date_str = date_str or utc_today_str()
+    return call_api_football("fixtures", {"date": date_str})
+
+
+def find_team_standing(standings_response: List[Dict[str, Any]], team_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if team_id is None:
+        return None
+
     for league_block in standings_response:
         league = league_block.get("league", {})
         for standing_group in league.get("standings", []):
@@ -288,88 +299,19 @@ def find_team_standing(standings_response, team_id):
     return None
 
 
-def extract_odds_summary(odds_response):
-    if not odds_response:
-        return {
-            "bookmaker_name": None,
-            "match_winner": None,
-            "markets_preview": [],
-        }
-
-    first_fixture = odds_response[0]
-    bookmakers = first_fixture.get("bookmakers", [])
-    if not bookmakers:
-        return {
-            "bookmaker_name": None,
-            "match_winner": None,
-            "markets_preview": [],
-        }
-
-    bookmaker = bookmakers[0]
-    bookmaker_name = bookmaker.get("name")
-    bets = bookmaker.get("bets", [])
-
-    match_winner = None
-    preview = []
-
-    for bet in bets:
-        bet_name = bet.get("name")
-        values = bet.get("values", [])
-
-        preview.append({
-            "bet_name": bet_name,
-            "values": values[:6],
-        })
-
-        if bet_name and bet_name.lower() in ["match winner", "winner", "1x2"]:
-            match_winner = {
-                "bet_name": bet_name,
-                "values": values,
-            }
-
-    return {
-        "bookmaker_name": bookmaker_name,
-        "match_winner": match_winner,
-        "markets_preview": preview[:10],
-    }
+def count_wins(form_string: Optional[str]) -> int:
+    if not form_string:
+        return 0
+    return form_string.count("W")
 
 
-def extract_match_winner_odds(match_winner_market):
-    if not match_winner_market:
+def safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b in (None, 0):
         return None
-
-    result = {"Home": None, "Draw": None, "Away": None}
-
-    for value in match_winner_market.get("values", []):
-        label = value.get("value")
-        odd = value.get("odd")
-        if label in result:
-            result[label] = odd
-
-    return result
+    return a / b
 
 
-def find_market_values(markets_preview, market_names, accepted_labels=None):
-    target_names = [m.lower() for m in market_names]
-
-    for market in markets_preview:
-        bet_name = (market.get("bet_name") or "").lower()
-        if bet_name in target_names:
-            values = market.get("values", [])
-            extracted = {}
-            for item in values:
-                label = item.get("value")
-                odd = item.get("odd")
-                if accepted_labels is None or label in accepted_labels:
-                    extracted[label] = odd
-            return {
-                "bet_name": market.get("bet_name"),
-                "values": extracted,
-            }
-    return None
-
-
-def implied_probability(decimal_odd):
+def implied_probability(decimal_odd: Optional[Any]) -> Optional[float]:
     if decimal_odd is None:
         return None
     try:
@@ -381,7 +323,7 @@ def implied_probability(decimal_odd):
         return None
 
 
-def normalize_probabilities(prob_dict):
+def normalize_probabilities(prob_dict: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
     valid_values = [v for v in prob_dict.values() if v is not None]
     total = sum(valid_values)
 
@@ -394,19 +336,16 @@ def normalize_probabilities(prob_dict):
     }
 
 
-def count_wins(form_string):
-    if not form_string:
-        return 0
-    return form_string.count("W")
+def compute_edges(model_probs: Dict[str, Optional[float]], market_probs: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
+    result = {}
+    for key in ["Home", "Draw", "Away"]:
+        mp = model_probs.get(key)
+        bp = market_probs.get(key)
+        result[key] = None if mp is None or bp is None else mp - bp
+    return result
 
 
-def safe_div(a, b):
-    if a is None or b in (None, 0):
-        return None
-    return a / b
-
-
-def build_model_probabilities(context):
+def build_model_probabilities(context: Dict[str, Any]) -> Dict[str, Any]:
     home_score = 1.0
     draw_score = 0.8
     away_score = 1.0
@@ -478,20 +417,99 @@ def build_model_probabilities(context):
     }
 
 
-def compute_edges(model_probs, market_probs):
-    result = {}
-    for key in ["Home", "Draw", "Away"]:
-        mp = model_probs.get(key)
-        bp = market_probs.get(key)
-        result[key] = None if mp is None or bp is None else mp - bp
-    return result
+def label_to_side(label: str, home_name: Optional[str], away_name: Optional[str]) -> Optional[str]:
+    normalized = (label or "").strip().lower()
+    home_name = (home_name or "").strip().lower()
+    away_name = (away_name or "").strip().lower()
+
+    if normalized in {"home", "1"}:
+        return "Home"
+    if normalized in {"draw", "x"}:
+        return "Draw"
+    if normalized in {"away", "2"}:
+        return "Away"
+    if home_name and normalized == home_name:
+        return "Home"
+    if away_name and normalized == away_name:
+        return "Away"
+    return None
 
 
-def filtered_edges_by_issue(odds_1x2, edges):
-    """
-    On bloque uniquement l'issue concernée si sa cote est trop basse.
-    On ne bloque plus tout le match.
-    """
+def pick_best_1x2_market(odds_response: List[Dict[str, Any]], home_name: Optional[str], away_name: Optional[str]) -> Dict[str, Any]:
+    market_names = {"match winner", "winner", "1x2"}
+    for fixture_odds in odds_response:
+        for bookmaker in fixture_odds.get("bookmakers", []):
+            for bet in bookmaker.get("bets", []):
+                bet_name = (bet.get("name") or "").strip().lower()
+                if bet_name not in market_names:
+                    continue
+
+                extracted = {"Home": None, "Draw": None, "Away": None}
+                for value in bet.get("values", []):
+                    side = label_to_side(value.get("value"), home_name, away_name)
+                    if side:
+                        extracted[side] = value.get("odd")
+
+                if all(extracted.values()):
+                    return {
+                        "bookmaker_name": bookmaker.get("name"),
+                        "bet_name": bet.get("name"),
+                        "odds_1x2": extracted,
+                    }
+
+    return {
+        "bookmaker_name": None,
+        "bet_name": None,
+        "odds_1x2": None,
+    }
+
+
+def extract_markets_preview(odds_response: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    preview: List[Dict[str, Any]] = []
+    for fixture_odds in odds_response:
+        for bookmaker in fixture_odds.get("bookmakers", [])[:2]:
+            for bet in bookmaker.get("bets", [])[:10]:
+                preview.append({
+                    "bookmaker_name": bookmaker.get("name"),
+                    "bet_name": bet.get("name"),
+                    "values": bet.get("values", [])[:6],
+                })
+        if preview:
+            break
+    return preview[:20]
+
+
+def find_market_values_any_bookmaker(
+    odds_response: List[Dict[str, Any]],
+    market_names: List[str],
+    accepted_labels: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    target_names = {m.lower() for m in market_names}
+
+    for fixture_odds in odds_response:
+        for bookmaker in fixture_odds.get("bookmakers", []):
+            for bet in bookmaker.get("bets", []):
+                bet_name = (bet.get("name") or "").lower()
+                if bet_name not in target_names:
+                    continue
+
+                extracted = {}
+                for item in bet.get("values", []):
+                    label = item.get("value")
+                    odd = item.get("odd")
+                    if accepted_labels is None or label in accepted_labels:
+                        extracted[label] = odd
+
+                if extracted:
+                    return {
+                        "bookmaker_name": bookmaker.get("name"),
+                        "bet_name": bet.get("name"),
+                        "values": extracted,
+                    }
+    return None
+
+
+def filtered_edges_by_issue(odds_1x2: Dict[str, Any], edges: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
     filtered = dict(edges)
 
     try:
@@ -500,77 +518,216 @@ def filtered_edges_by_issue(odds_1x2, edges):
         home_odd = None
 
     try:
+        draw_odd = float(odds_1x2["Draw"]) if odds_1x2.get("Draw") else None
+    except Exception:
+        draw_odd = None
+
+    try:
         away_odd = float(odds_1x2["Away"]) if odds_1x2.get("Away") else None
     except Exception:
         away_odd = None
 
-    if home_odd is not None and home_odd < 1.60:
+    if home_odd is not None and home_odd < MIN_ODD_HOME_AWAY:
         filtered["Home"] = None
 
-    if away_odd is not None and away_odd < 1.60:
+    if away_odd is not None and away_odd < MIN_ODD_HOME_AWAY:
         filtered["Away"] = None
+
+    if draw_odd is not None and draw_odd < MIN_ODD_DRAW:
+        filtered["Draw"] = None
 
     return filtered
 
 
-def best_edge(edges):
-    candidates = {k: v for k, v in edges.items() if v is not None}
-    if not candidates:
-        return None, None
-    best_key = max(candidates, key=candidates.get)
-    return best_key, candidates[best_key]
+def build_confluence_flags(context: Dict[str, Any], side: str) -> Dict[str, bool]:
+    home_rank = context.get("home_rank")
+    away_rank = context.get("away_rank")
+    home_points = context.get("home_points")
+    away_points = context.get("away_points")
+    home_form = context.get("home_form") or ""
+    away_form = context.get("away_form") or ""
+    home_goals_for = context.get("home_goals_for")
+    away_goals_for = context.get("away_goals_for")
+    home_goals_against = context.get("home_goals_against")
+    away_goals_against = context.get("away_goals_against")
+
+    flags = {
+        "rank_advantage": False,
+        "points_advantage": False,
+        "form_advantage": False,
+        "goal_profile_advantage": False,
+    }
+
+    if side == "Home":
+        if home_rank is not None and away_rank is not None and home_rank < away_rank:
+            flags["rank_advantage"] = True
+        if home_points is not None and away_points is not None and home_points > away_points:
+            flags["points_advantage"] = True
+        if count_wins(home_form) > count_wins(away_form):
+            flags["form_advantage"] = True
+        if (
+            home_goals_for is not None and away_goals_for is not None
+            and home_goals_against is not None and away_goals_against is not None
+            and home_goals_for >= away_goals_for
+            and home_goals_against <= away_goals_against
+        ):
+            flags["goal_profile_advantage"] = True
+
+    elif side == "Away":
+        if home_rank is not None and away_rank is not None and away_rank < home_rank:
+            flags["rank_advantage"] = True
+        if home_points is not None and away_points is not None and away_points > home_points:
+            flags["points_advantage"] = True
+        if count_wins(away_form) > count_wins(home_form):
+            flags["form_advantage"] = True
+        if (
+            home_goals_for is not None and away_goals_for is not None
+            and home_goals_against is not None and away_goals_against is not None
+            and away_goals_for >= home_goals_for
+            and away_goals_against <= home_goals_against
+        ):
+            flags["goal_profile_advantage"] = True
+
+    else:
+        if home_rank is not None and away_rank is not None and abs(home_rank - away_rank) <= 2:
+            flags["rank_advantage"] = True
+        if home_points is not None and away_points is not None and abs(home_points - away_points) <= 3:
+            flags["points_advantage"] = True
+        if abs(count_wins(home_form) - count_wins(away_form)) <= 1:
+            flags["form_advantage"] = True
+        if (
+            home_goals_for is not None and away_goals_for is not None
+            and home_goals_against is not None and away_goals_against is not None
+            and abs(home_goals_for - away_goals_for) <= 5
+            and abs(home_goals_against - away_goals_against) <= 5
+        ):
+            flags["goal_profile_advantage"] = True
+
+    return flags
 
 
-def build_value_decision_with_edge(detail, odds_1x2, model_probs, market_probs, edges):
+def build_value_decision_with_3_levels(
+    detail: Dict[str, Any],
+    odds_1x2: Dict[str, Any],
+    model_probs: Dict[str, Optional[float]],
+    market_probs: Dict[str, Optional[float]],
+    edges: Dict[str, Optional[float]],
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
     if is_live_or_not_prematch(detail.get("status_short")):
         return {
             "decision": "NO_BET",
+            "side": None,
+            "level": 0,
+            "level_name": None,
             "rationale": ["Le match n'est plus en pré-match."],
             "best_edge_label": None,
             "best_edge_value": None,
             "allowed_edges": edges,
+            "confluence_flags": {},
+            "confluence_count": 0,
         }
 
     allowed_edges = filtered_edges_by_issue(odds_1x2, edges)
-    edge_label, edge_value = best_edge(allowed_edges)
+    candidates = {k: v for k, v in allowed_edges.items() if v is not None}
 
-    if edge_label is None or edge_value is None:
+    if not candidates:
         return {
             "decision": "NO_BET",
-            "rationale": ["Aucune issue autorisée avec edge exploitable après filtres."],
+            "side": None,
+            "level": 0,
+            "level_name": None,
+            "rationale": ["Aucune issue autorisée après filtres de cotes minimales."],
             "best_edge_label": None,
             "best_edge_value": None,
             "allowed_edges": allowed_edges,
+            "confluence_flags": {},
+            "confluence_count": 0,
         }
 
-    if edge_value < 0.05:
+    best_side = max(candidates, key=candidates.get)
+    best_edge_value = candidates[best_side]
+    confluence_flags = build_confluence_flags(context, best_side)
+    confluence_count = sum(1 for value in confluence_flags.values() if value)
+
+    level = 0
+    if best_edge_value >= LEVELS_1X2[3]["edge_min"] and confluence_count >= 3:
+        level = 3
+    elif best_edge_value >= LEVELS_1X2[2]["edge_min"] and confluence_count >= 2:
+        level = 2
+    elif best_edge_value >= LEVELS_1X2[1]["edge_min"]:
+        level = 1
+
+    try:
+        selected_odd = float(odds_1x2[best_side]) if odds_1x2.get(best_side) else None
+    except Exception:
+        selected_odd = None
+
+    if level == 3 and selected_odd is not None and selected_odd > MAX_ODD_MAIN_SIGNAL:
+        level = 2
+
+    if level == 0:
         return {
             "decision": "NO_BET",
-            "rationale": ["Best allowed edge < 5% : pas d'avantage suffisant contre le marché."],
-            "best_edge_label": edge_label,
-            "best_edge_value": edge_value,
+            "side": best_side,
+            "level": 0,
+            "level_name": None,
+            "rationale": [
+                "Edge réel mais insuffisant pour atteindre le niveau 1 utile.",
+                f"Best edge = {round(best_edge_value * 100, 2)}%.",
+            ],
+            "best_edge_label": best_side,
+            "best_edge_value": best_edge_value,
             "allowed_edges": allowed_edges,
+            "confluence_flags": confluence_flags,
+            "confluence_count": confluence_count,
         }
 
     label_map = {
-        "Home": "VALUE_HOME",
-        "Draw": "VALUE_DRAW",
-        "Away": "VALUE_AWAY",
+        1: {
+            "Home": "WATCH_HOME",
+            "Draw": "WATCH_DRAW",
+            "Away": "WATCH_AWAY",
+        },
+        2: {
+            "Home": "VALUE_HOME",
+            "Draw": "VALUE_DRAW",
+            "Away": "VALUE_AWAY",
+        },
+        3: {
+            "Home": "MAIN_HOME",
+            "Draw": "MAIN_DRAW",
+            "Away": "MAIN_AWAY",
+        },
     }
+
+    rationale = [
+        f"Best allowed edge sur {best_side} = {round(best_edge_value * 100, 2)}%.",
+        f"Confluence = {confluence_count}/4.",
+    ]
+
+    if level == 1:
+        rationale.append("Signal exploitable mais encore léger: surveillance ou petite exposition.")
+    elif level == 2:
+        rationale.append("Value bet valide: edge + confluence suffisante.")
+    elif level == 3:
+        rationale.append("Signal principal: edge fort + confluence élevée.")
 
     return {
-        "decision": label_map.get(edge_label, "NO_BET"),
-        "rationale": [
-            f"Edge positif autorisé sur {edge_label}.",
-            f"Best allowed edge = {round(edge_value * 100, 2)}%.",
-        ],
-        "best_edge_label": edge_label,
-        "best_edge_value": edge_value,
+        "decision": label_map[level][best_side],
+        "side": best_side,
+        "level": level,
+        "level_name": LEVELS_1X2[level]["name"],
+        "rationale": rationale,
+        "best_edge_label": best_side,
+        "best_edge_value": best_edge_value,
         "allowed_edges": allowed_edges,
+        "confluence_flags": confluence_flags,
+        "confluence_count": confluence_count,
     }
 
 
-def build_goals_context(home_standing, away_standing):
+def build_goals_context(home_standing: Optional[Dict[str, Any]], away_standing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "home_goals_for": home_standing["goals_for"] if home_standing else None,
         "home_goals_against": home_standing["goals_against"] if home_standing else None,
@@ -583,8 +740,22 @@ def build_goals_context(home_standing, away_standing):
     }
 
 
-def build_goals_value_decision(goals_context, btts_market, ou25_market):
-    rationale = []
+def goals_level_from_confidence(confidence_count: int) -> int:
+    if confidence_count >= LEVELS_GOALS[3]["confidence_min"]:
+        return 3
+    if confidence_count >= LEVELS_GOALS[2]["confidence_min"]:
+        return 2
+    if confidence_count >= LEVELS_GOALS[1]["confidence_min"]:
+        return 1
+    return 0
+
+
+def build_goals_value_decision_3_levels(
+    goals_context: Dict[str, Any],
+    btts_market: Optional[Dict[str, Any]],
+    ou25_market: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    rationale: List[str] = []
     decision = "NO_BET"
 
     home_gf_avg = safe_div(goals_context["home_goals_for"], goals_context["home_played"])
@@ -604,87 +775,125 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
     if away_ga_avg is not None and away_ga_avg >= 1.15:
         concede_signal += 1
 
+    best_market = None
+    best_level = 0
+    best_confidence = 0
+
     if btts_market:
         yes_odd = btts_market["values"].get("Yes")
         no_odd = btts_market["values"].get("No")
 
         if yes_odd and no_odd:
-            yes_prob = implied_probability(yes_odd)
-            no_prob = implied_probability(no_odd)
+            confidence_yes = 0
+            confidence_no = 0
 
-            if yes_prob is not None and no_prob is not None and abs(yes_prob - no_prob) < 0.05:
-                rationale.append("BTTS trop équilibré par le marché : NO_BET.")
-            else:
-                if attack_signal >= 2 and concede_signal >= 1 and float(yes_odd) >= 1.60:
-                    decision = "LEAN_BTTS_YES"
-                    rationale.append("Les deux équipes affichent des signaux offensifs suffisants.")
-                    rationale.append("Les profils défensifs ne ferment pas naturellement le match.")
-                    return {
-                        "decision": decision,
-                        "rationale": rationale,
-                        "home_gf_avg": home_gf_avg,
-                        "away_gf_avg": away_gf_avg,
-                        "home_ga_avg": home_ga_avg,
-                        "away_ga_avg": away_ga_avg,
-                    }
+            if attack_signal >= 2:
+                confidence_yes += 2
+            if concede_signal >= 1:
+                confidence_yes += 1
+            if home_gf_avg is not None and away_gf_avg is not None and home_gf_avg >= 1.20 and away_gf_avg >= 1.20:
+                confidence_yes += 1
 
-                if attack_signal <= 1 and concede_signal <= 1 and float(no_odd) >= 1.60:
-                    decision = "LEAN_BTTS_NO"
-                    rationale.append("Le profil global ne pousse pas clairement vers deux équipes buteuses.")
-                    rationale.append("Signaux offensifs insuffisants pour un BTTS fort.")
-                    return {
-                        "decision": decision,
-                        "rationale": rationale,
-                        "home_gf_avg": home_gf_avg,
-                        "away_gf_avg": away_gf_avg,
-                        "home_ga_avg": home_ga_avg,
-                        "away_ga_avg": away_ga_avg,
-                    }
+            if attack_signal <= 1:
+                confidence_no += 2
+            if concede_signal <= 1:
+                confidence_no += 1
+            if home_ga_avg is not None and away_ga_avg is not None and home_ga_avg < 1.10 and away_ga_avg < 1.10:
+                confidence_no += 1
+
+            level_yes = goals_level_from_confidence(confidence_yes) if float(yes_odd) >= 1.60 else 0
+            level_no = goals_level_from_confidence(confidence_no) if float(no_odd) >= 1.60 else 0
+
+            if level_yes > best_level or (level_yes == best_level and confidence_yes > best_confidence):
+                best_level = level_yes
+                best_confidence = confidence_yes
+                best_market = ("BTTS_YES", yes_odd, confidence_yes)
+
+            if level_no > best_level or (level_no == best_level and confidence_no > best_confidence):
+                best_level = level_no
+                best_confidence = confidence_no
+                best_market = ("BTTS_NO", no_odd, confidence_no)
 
     if ou25_market:
         over_odd = ou25_market["values"].get("Over 2.5")
         under_odd = ou25_market["values"].get("Under 2.5")
 
         if over_odd and under_odd:
-            over_prob = implied_probability(over_odd)
-            under_prob = implied_probability(under_odd)
+            confidence_over = 0
+            confidence_under = 0
 
-            if over_prob is not None and under_prob is not None and abs(over_prob - under_prob) < 0.05:
-                rationale.append("O/U 2.5 trop équilibré par le marché : NO_BET.")
-            else:
-                # Blocage under si profil offensif adverse trop fort
-                if away_gf_avg is not None and away_gf_avg >= 1.80 and home_ga_avg is not None and home_ga_avg >= 1.30:
-                    rationale.append("Blocage UNDER : profil offensif/defensif incompatible avec un under propre.")
-                elif attack_signal <= 1 and concede_signal <= 1 and float(under_odd) >= 1.70:
-                    decision = "LEAN_UNDER_2_5"
-                    rationale.append("Le profil statistique ne soutient pas un match très ouvert.")
-                    rationale.append("Peu de signaux combinés pour dépasser 2.5 buts.")
-                    return {
-                        "decision": decision,
-                        "rationale": rationale,
-                        "home_gf_avg": home_gf_avg,
-                        "away_gf_avg": away_gf_avg,
-                        "home_ga_avg": home_ga_avg,
-                        "away_ga_avg": away_ga_avg,
-                    }
+            if attack_signal >= 2:
+                confidence_over += 2
+            if concede_signal >= 2:
+                confidence_over += 2
+            if home_gf_avg is not None and away_gf_avg is not None and (home_gf_avg + away_gf_avg) >= 3.00:
+                confidence_over += 1
 
-                if attack_signal >= 2 and concede_signal >= 2 and float(over_odd) >= 1.70:
-                    decision = "LEAN_OVER_2_5"
-                    rationale.append("Les moyennes offensives et défensives suggèrent un match ouvert.")
-                    rationale.append("Le profil global pousse vers 3 buts ou plus.")
-                    return {
-                        "decision": decision,
-                        "rationale": rationale,
-                        "home_gf_avg": home_gf_avg,
-                        "away_gf_avg": away_gf_avg,
-                        "home_ga_avg": home_ga_avg,
-                        "away_ga_avg": away_ga_avg,
-                    }
+            if attack_signal <= 1:
+                confidence_under += 2
+            if concede_signal <= 1:
+                confidence_under += 2
+            if home_gf_avg is not None and away_gf_avg is not None and (home_gf_avg + away_gf_avg) <= 2.20:
+                confidence_under += 1
 
-    rationale.append("Les marchés buts ne montrent pas d'avantage exploitable suffisant.")
-    rationale.append("Discipline : NO_BET.")
+            if away_gf_avg is not None and away_gf_avg >= 1.80 and home_ga_avg is not None and home_ga_avg >= 1.30:
+                confidence_under = max(confidence_under - 2, 0)
+
+            level_over = goals_level_from_confidence(confidence_over) if float(over_odd) >= 1.70 else 0
+            level_under = goals_level_from_confidence(confidence_under) if float(under_odd) >= 1.70 else 0
+
+            if level_over > best_level or (level_over == best_level and confidence_over > best_confidence):
+                best_level = level_over
+                best_confidence = confidence_over
+                best_market = ("OVER_2_5", over_odd, confidence_over)
+
+            if level_under > best_level or (level_under == best_level and confidence_under > best_confidence):
+                best_level = level_under
+                best_confidence = confidence_under
+                best_market = ("UNDER_2_5", under_odd, confidence_under)
+
+    if not best_market or best_level == 0:
+        rationale.append("Les marchés buts ne montrent pas un avantage net.")
+        rationale.append("Discipline: NO_BET.")
+        return {
+            "decision": decision,
+            "level": 0,
+            "level_name": None,
+            "market": None,
+            "confidence_count": 0,
+            "rationale": rationale,
+            "home_gf_avg": home_gf_avg,
+            "away_gf_avg": away_gf_avg,
+            "home_ga_avg": home_ga_avg,
+            "away_ga_avg": away_ga_avg,
+        }
+
+    market_name, selected_odd, confidence_count = best_market
+
+    if market_name == "BTTS_YES":
+        decision = ["", "WATCH_BTTS_YES", "VALUE_BTTS_YES", "MAIN_BTTS_YES"][best_level]
+    elif market_name == "BTTS_NO":
+        decision = ["", "WATCH_BTTS_NO", "VALUE_BTTS_NO", "MAIN_BTTS_NO"][best_level]
+    elif market_name == "OVER_2_5":
+        decision = ["", "WATCH_OVER_2_5", "VALUE_OVER_2_5", "MAIN_OVER_2_5"][best_level]
+    else:
+        decision = ["", "WATCH_UNDER_2_5", "VALUE_UNDER_2_5", "MAIN_UNDER_2_5"][best_level]
+
+    rationale.append(f"Meilleur marché buts = {market_name} @ {selected_odd}.")
+    rationale.append(f"Confiance = {confidence_count}.")
+    if best_level == 1:
+        rationale.append("Lecture exploitable mais encore prudente.")
+    elif best_level == 2:
+        rationale.append("Marché buts avec assez de confluence pour une vraie value.")
+    else:
+        rationale.append("Signal principal sur les buts: forte cohérence du profil statistique.")
+
     return {
         "decision": decision,
+        "level": best_level,
+        "level_name": LEVELS_GOALS[best_level]["name"],
+        "market": market_name,
+        "confidence_count": confidence_count,
         "rationale": rationale,
         "home_gf_avg": home_gf_avg,
         "away_gf_avg": away_gf_avg,
@@ -693,56 +902,63 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
     }
 
 
-# =========================
-# ROUTES
-# =========================
-@app.route("/fixture-value")
-def fixture_value():
-    fixture_id = request.args.get("fixture_id", "").strip()
+def summarize_1x2_signal(detail: Dict[str, Any], decision_data: Dict[str, Any], odds_1x2: Dict[str, Any]) -> str:
+    side = decision_data.get("side")
+    return (
+        "APEXFOOTBALL 1X2\n\n"
+        f"{detail['home']} vs {detail['away']}\n"
+        f"{detail['league_name']} ({detail['country']})\n"
+        f"{format_match_time(detail['date'])}\n\n"
+        f"Decision: {decision_data['decision']}\n"
+        f"Level: {decision_data.get('level')} - {decision_data.get('level_name')}\n"
+        f"Side: {side}\n"
+        f"Odd: {odds_1x2.get(side) if side else 'N/A'}\n"
+        f"Best edge: {round(decision_data['best_edge_value'] * 100, 2) if decision_data.get('best_edge_value') is not None else 'N/A'}%\n"
+        f"Confluence: {decision_data.get('confluence_count', 0)}/4\n"
+        f"Rationale: {' | '.join(decision_data.get('rationale', []))}"
+    )
 
-    if not fixture_id:
-        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-    if not fixture_id.isdigit():
-        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
 
+def summarize_goals_signal(detail: Dict[str, Any], decision_data: Dict[str, Any]) -> str:
+    return (
+        "APEXFOOTBALL GOALS\n\n"
+        f"{detail['home']} vs {detail['away']}\n"
+        f"{detail['league_name']} ({detail['country']})\n"
+        f"{format_match_time(detail['date'])}\n\n"
+        f"Decision: {decision_data['decision']}\n"
+        f"Level: {decision_data.get('level')} - {decision_data.get('level_name')}\n"
+        f"Market: {decision_data.get('market')}\n"
+        f"Confidence: {decision_data.get('confidence_count', 0)}\n"
+        f"Rationale: {' | '.join(decision_data.get('rationale', []))}"
+    )
+
+
+def analyse_fixture_value_core(fixture_id: str) -> Tuple[Dict[str, Any], int]:
     fixture_data, fixture_status = get_fixture_by_id(fixture_id)
     if fixture_status != 200:
-        return jsonify(fixture_data), fixture_status
+        return fixture_data, fixture_status
 
     match = fixture_data["fixture"]
-    detail = build_fixture_detail_summary(match)
+    detail = build_fixture_detail(match)
 
     if is_live_or_not_prematch(detail["status_short"]):
-        message = (
-            "VALUE ANALYSIS BLOCKED\n\n"
-            f"{detail['home']} vs {detail['away']}\n"
-            f"Status: {detail['status_long']} ({detail['status_short']})\n"
-            "Decision: NO_BET\n"
-            "Reason: fixture is not pre-match anymore."
-        )
-        telegram_data, telegram_status = send_telegram_message(message)
-
-        return jsonify({
+        return {
             "status": "ok",
             "fixture": detail,
             "decision": "NO_BET",
             "message": "Fixture is not pre-match anymore",
-            "telegram_status": telegram_data,
-            "telegram_http_status": telegram_status,
-        }), 200
-
-    teams = build_fixture_teams_info(match)
+        }, 200
 
     standings_data, standings_status = call_api_football(
         "standings",
         {"league": detail["league_id"], "season": detail["season"]}
     )
     if standings_status != 200:
-        return jsonify(standings_data), standings_status
+        return standings_data, standings_status
 
     standings_response = standings_data["data"].get("response", [])
-    home_standing = find_team_standing(standings_response, teams["home_team_id"])
-    away_standing = find_team_standing(standings_response, teams["away_team_id"])
+    home_standing = find_team_standing(standings_response, detail["home_team_id"])
+    away_standing = find_team_standing(standings_response, detail["away_team_id"])
 
     context = {
         "home_rank": home_standing["rank"] if home_standing else None,
@@ -759,36 +975,28 @@ def fixture_value():
 
     odds_data, odds_status = call_api_football("odds", {"fixture": fixture_id})
     if odds_status != 200:
-        return jsonify(odds_data), odds_status
+        return odds_data, odds_status
 
     odds_response = odds_data["data"].get("response", [])
     if not odds_response:
-        return jsonify({
+        return {
             "status": "ok",
             "fixture": detail,
             "decision": "NO_BET",
             "message": "No odds found for this fixture",
-        }), 200
+        }, 200
 
-    odds_summary = extract_odds_summary(odds_response)
-    match_winner_market = odds_summary.get("match_winner")
+    market_pick = pick_best_1x2_market(odds_response, detail["home"], detail["away"])
+    odds_1x2 = market_pick["odds_1x2"]
 
-    if not match_winner_market:
-        return jsonify({
-            "status": "ok",
-            "fixture": detail,
-            "decision": "NO_BET",
-            "message": "No 1X2 market found for this fixture",
-        }), 200
-
-    odds_1x2 = extract_match_winner_odds(match_winner_market)
     if not odds_1x2:
-        return jsonify({
+        return {
             "status": "ok",
             "fixture": detail,
             "decision": "NO_BET",
-            "message": "Could not extract 1X2 odds",
-        }), 200
+            "message": "No complete 1X2 market found for this fixture",
+            "markets_preview": extract_markets_preview(odds_response),
+        }, 200
 
     market_implied_raw = {
         "Home": implied_probability(odds_1x2["Home"]),
@@ -801,177 +1009,376 @@ def fixture_value():
     model_probs = model_data["normalized_probabilities"]
     edges = compute_edges(model_probs, market_implied_normalized)
 
-    decision_data = build_value_decision_with_edge(
+    decision_data = build_value_decision_with_3_levels(
         detail=detail,
         odds_1x2=odds_1x2,
         model_probs=model_probs,
         market_probs=market_implied_normalized,
         edges=edges,
+        context=context,
     )
 
-    allowed_edges = decision_data["allowed_edges"]
-
-    message = (
-        "VALUE ANALYSIS\n\n"
-        f"{detail['home']} vs {detail['away']}\n"
-        f"{detail['league_name']} ({detail['country']})\n"
-        f"{format_match_time(detail['date'])}\n\n"
-        f"Odds 1X2:\n"
-        f"Home: {odds_1x2['Home']} | Draw: {odds_1x2['Draw']} | Away: {odds_1x2['Away']}\n\n"
-        f"Marché normalisé:\n"
-        f"Home: {round(market_implied_normalized['Home'] * 100, 1) if market_implied_normalized['Home'] is not None else 'N/A'}%\n"
-        f"Draw: {round(market_implied_normalized['Draw'] * 100, 1) if market_implied_normalized['Draw'] is not None else 'N/A'}%\n"
-        f"Away: {round(market_implied_normalized['Away'] * 100, 1) if market_implied_normalized['Away'] is not None else 'N/A'}%\n\n"
-        f"Modèle:\n"
-        f"Home: {round(model_probs['Home'] * 100, 1)}%\n"
-        f"Draw: {round(model_probs['Draw'] * 100, 1)}%\n"
-        f"Away: {round(model_probs['Away'] * 100, 1)}%\n\n"
-        f"Edges:\n"
-        f"Home: {round(edges['Home'] * 100, 2) if edges['Home'] is not None else 'N/A'}%\n"
-        f"Draw: {round(edges['Draw'] * 100, 2) if edges['Draw'] is not None else 'N/A'}%\n"
-        f"Away: {round(edges['Away'] * 100, 2) if edges['Away'] is not None else 'N/A'}%\n\n"
-        f"Allowed edges:\n"
-        f"Home: {round(allowed_edges['Home'] * 100, 2) if allowed_edges['Home'] is not None else 'BLOCKED'}%\n"
-        f"Draw: {round(allowed_edges['Draw'] * 100, 2) if allowed_edges['Draw'] is not None else 'BLOCKED'}%\n"
-        f"Away: {round(allowed_edges['Away'] * 100, 2) if allowed_edges['Away'] is not None else 'BLOCKED'}%\n\n"
-        f"Decision: {decision_data['decision']}\n"
-        f"Rationale: {' | '.join(decision_data['rationale'])}"
-    )
-
-    telegram_data, telegram_status = send_telegram_message(message)
-
-    return jsonify({
+    return {
         "status": "ok",
         "fixture": detail,
         "context": context,
+        "bookmaker_name": market_pick["bookmaker_name"],
+        "market_name": market_pick["bet_name"],
         "odds_1x2": odds_1x2,
         "market_implied_raw": market_implied_raw,
         "market_implied_normalized": market_implied_normalized,
         "model_probabilities": model_probs,
         "model_raw_scores": model_data["raw_scores"],
         "edges": edges,
-        "allowed_edges": allowed_edges,
+        "allowed_edges": decision_data["allowed_edges"],
         "best_edge_label": decision_data["best_edge_label"],
         "best_edge_value": decision_data["best_edge_value"],
+        "side": decision_data["side"],
+        "level": decision_data["level"],
+        "level_name": decision_data["level_name"],
         "decision": decision_data["decision"],
         "rationale": decision_data["rationale"],
-        "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status,
-    }), 200
+        "confluence_flags": decision_data["confluence_flags"],
+        "confluence_count": decision_data["confluence_count"],
+    }, 200
 
 
-@app.route("/fixture-goals-value")
-def fixture_goals_value():
-    fixture_id = request.args.get("fixture_id", "").strip()
-
-    if not fixture_id:
-        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
-    if not fixture_id.isdigit():
-        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
-
+def analyse_fixture_goals_core(fixture_id: str) -> Tuple[Dict[str, Any], int]:
     fixture_data, fixture_status = get_fixture_by_id(fixture_id)
     if fixture_status != 200:
-        return jsonify(fixture_data), fixture_status
+        return fixture_data, fixture_status
 
     match = fixture_data["fixture"]
-    detail = build_fixture_detail_summary(match)
+    detail = build_fixture_detail(match)
 
     if is_live_or_not_prematch(detail["status_short"]):
-        message = (
-            "GOALS VALUE ANALYSIS BLOCKED\n\n"
-            f"{detail['home']} vs {detail['away']}\n"
-            f"Status: {detail['status_long']} ({detail['status_short']})\n"
-            "Decision: NO_BET\n"
-            "Reason: fixture is not pre-match anymore."
-        )
-        telegram_data, telegram_status = send_telegram_message(message)
-
-        return jsonify({
+        return {
             "status": "ok",
             "fixture": detail,
             "decision": "NO_BET",
             "message": "Fixture is not pre-match anymore",
-            "telegram_status": telegram_data,
-            "telegram_http_status": telegram_status,
-        }), 200
-
-    teams = build_fixture_teams_info(match)
+        }, 200
 
     standings_data, standings_status = call_api_football(
         "standings",
         {"league": detail["league_id"], "season": detail["season"]}
     )
     if standings_status != 200:
-        return jsonify(standings_data), standings_status
+        return standings_data, standings_status
 
     standings_response = standings_data["data"].get("response", [])
-    home_standing = find_team_standing(standings_response, teams["home_team_id"])
-    away_standing = find_team_standing(standings_response, teams["away_team_id"])
-
+    home_standing = find_team_standing(standings_response, detail["home_team_id"])
+    away_standing = find_team_standing(standings_response, detail["away_team_id"])
     goals_context = build_goals_context(home_standing, away_standing)
 
     odds_data, odds_status = call_api_football("odds", {"fixture": fixture_id})
     if odds_status != 200:
-        return jsonify(odds_data), odds_status
+        return odds_data, odds_status
 
     odds_response = odds_data["data"].get("response", [])
     if not odds_response:
-        return jsonify({
+        return {
             "status": "ok",
             "fixture": detail,
             "decision": "NO_BET",
             "message": "No odds found for this fixture",
-        }), 200
+        }, 200
 
-    odds_summary = extract_odds_summary(odds_response)
-    markets_preview = odds_summary.get("markets_preview", [])
-
-    btts_market = find_market_values(
-        markets_preview,
+    btts_market = find_market_values_any_bookmaker(
+        odds_response,
         ["Both Teams Score", "Both Teams To Score"],
         accepted_labels=["Yes", "No"],
     )
 
-    ou25_market = find_market_values(
-        markets_preview,
+    ou25_market = find_market_values_any_bookmaker(
+        odds_response,
         ["Goals Over/Under", "Over/Under"],
         accepted_labels=["Over 2.5", "Under 2.5"],
     )
 
-    decision_data = build_goals_value_decision(goals_context, btts_market, ou25_market)
+    decision_data = build_goals_value_decision_3_levels(goals_context, btts_market, ou25_market)
 
-    message = (
-        "GOALS VALUE ANALYSIS\n\n"
-        f"{detail['home']} vs {detail['away']}\n"
-        f"{detail['league_name']} ({detail['country']})\n"
-        f"{format_match_time(detail['date'])}\n\n"
-        f"BTTS: {btts_market['values'] if btts_market else 'N/A'}\n"
-        f"O/U 2.5: {ou25_market['values'] if ou25_market else 'N/A'}\n\n"
-        f"GF avg: {round(decision_data['home_gf_avg'], 2) if decision_data['home_gf_avg'] is not None else 'N/A'} vs "
-        f"{round(decision_data['away_gf_avg'], 2) if decision_data['away_gf_avg'] is not None else 'N/A'}\n"
-        f"GA avg: {round(decision_data['home_ga_avg'], 2) if decision_data['home_ga_avg'] is not None else 'N/A'} vs "
-        f"{round(decision_data['away_ga_avg'], 2) if decision_data['away_ga_avg'] is not None else 'N/A'}\n\n"
-        f"Decision: {decision_data['decision']}\n"
-        f"Rationale: {' | '.join(decision_data['rationale'])}"
-    )
-
-    telegram_data, telegram_status = send_telegram_message(message)
-
-    return jsonify({
+    return {
         "status": "ok",
         "fixture": detail,
         "goals_context": goals_context,
         "btts_market": btts_market,
         "over_under_2_5_market": ou25_market,
+        "level": decision_data["level"],
+        "level_name": decision_data["level_name"],
+        "market": decision_data["market"],
+        "confidence_count": decision_data["confidence_count"],
         "decision": decision_data["decision"],
         "rationale": decision_data["rationale"],
         "home_gf_avg": decision_data["home_gf_avg"],
         "away_gf_avg": decision_data["away_gf_avg"],
         "home_ga_avg": decision_data["home_ga_avg"],
         "away_ga_avg": decision_data["away_ga_avg"],
-        "telegram_status": telegram_data,
-        "telegram_http_status": telegram_status,
-    }), 200
+    }, 200
+
+
+# =========================
+# ROUTES
+# =========================
+@app.route("/")
+def home():
+    return ok({
+        "status": "ok",
+        "service": "Telegram-Apexfoot-bot",
+        "version": "core-v4-3-levels",
+        "time_utc": now_utc().isoformat(),
+        "routes": [
+            "/ping",
+            "/fixture-value?fixture_id=...",
+            "/fixture-goals-value?fixture_id=...",
+            "/debug-fixture-value?fixture_id=...",
+            "/fixtures-today",
+            "/scan-value",
+            "/scan-goals",
+        ],
+    })
+
+
+@app.route("/ping")
+def ping():
+    return ok({
+        "status": "ok",
+        "message": "pong",
+        "time_utc": now_utc().isoformat(),
+    })
+
+
+@app.route("/fixtures-today")
+def fixtures_today():
+    date_str = request.args.get("date", "").strip() or utc_today_str()
+    data, status_code = get_fixtures_by_date(date_str)
+    if status_code != 200:
+        return ok(data, status_code)
+
+    fixtures = data["data"].get("response", [])
+    selected = []
+
+    for match in fixtures:
+        if not is_target_league_by_id(match):
+            continue
+        if not is_priority_fixture(match):
+            continue
+        if not is_pre_match_fixture(match):
+            continue
+
+        detail = build_fixture_detail(match)
+        selected.append({
+            "fixture_id": detail["fixture_id"],
+            "kickoff_utc": detail["kickoff_utc"],
+            "league_id": detail["league_id"],
+            "league_name": detail["league_name"],
+            "country": detail["country"],
+            "home": detail["home"],
+            "away": detail["away"],
+        })
+
+    selected.sort(key=lambda x: x["kickoff_utc"] or "")
+
+    return ok({
+        "status": "ok",
+        "date": date_str,
+        "count": len(selected),
+        "fixtures": selected,
+    })
+
+
+@app.route("/fixture-value")
+def fixture_value():
+    fixture_id = request.args.get("fixture_id", "").strip()
+    send_to_telegram = request.args.get("send_telegram", "1").strip() == "1"
+
+    if not fixture_id:
+        return err("Missing 'fixture_id' query parameter", 400)
+    if not fixture_id.isdigit():
+        return err("fixture_id must be numeric", 400)
+
+    payload, status_code = analyse_fixture_value_core(fixture_id)
+
+    if status_code == 200 and payload.get("status") == "ok" and send_to_telegram:
+        if payload.get("decision") != "NO_BET":
+            message = summarize_1x2_signal(payload["fixture"], payload, payload["odds_1x2"])
+            telegram_data, telegram_status = send_telegram_message(message)
+            payload["telegram_status"] = telegram_data
+            payload["telegram_http_status"] = telegram_status
+
+    return ok(payload, status_code)
+
+
+@app.route("/fixture-goals-value")
+def fixture_goals_value():
+    fixture_id = request.args.get("fixture_id", "").strip()
+    send_to_telegram = request.args.get("send_telegram", "1").strip() == "1"
+
+    if not fixture_id:
+        return err("Missing 'fixture_id' query parameter", 400)
+    if not fixture_id.isdigit():
+        return err("fixture_id must be numeric", 400)
+
+    payload, status_code = analyse_fixture_goals_core(fixture_id)
+
+    if status_code == 200 and payload.get("status") == "ok" and send_to_telegram:
+        if payload.get("decision") != "NO_BET":
+            message = summarize_goals_signal(payload["fixture"], payload)
+            telegram_data, telegram_status = send_telegram_message(message)
+            payload["telegram_status"] = telegram_data
+            payload["telegram_http_status"] = telegram_status
+
+    return ok(payload, status_code)
+
+
+@app.route("/scan-value")
+def scan_value():
+    date_str = request.args.get("date", "").strip() or utc_today_str()
+    min_level_raw = request.args.get("min_level", "2").strip()
+    send_to_telegram = request.args.get("send_telegram", "0").strip() == "1"
+
+    if not min_level_raw.isdigit():
+        return err("min_level must be numeric", 400)
+
+    min_level = int(min_level_raw)
+    if min_level not in {1, 2, 3}:
+        return err("min_level must be 1, 2 or 3", 400)
+
+    data, status_code = get_fixtures_by_date(date_str)
+    if status_code != 200:
+        return ok(data, status_code)
+
+    fixtures = data["data"].get("response", [])
+    selected = []
+    telegram_results = []
+
+    for match in fixtures:
+        if not is_target_league_by_id(match):
+            continue
+        if not is_priority_fixture(match):
+            continue
+        if not is_pre_match_fixture(match):
+            continue
+
+        detail = build_fixture_detail(match)
+        payload, analyse_status = analyse_fixture_value_core(str(detail["fixture_id"]))
+        if analyse_status != 200 or payload.get("status") != "ok":
+            continue
+        if payload.get("level", 0) < min_level:
+            continue
+
+        selected.append({
+            "fixture_id": payload["fixture"]["fixture_id"],
+            "kickoff_utc": payload["fixture"]["kickoff_utc"],
+            "league_name": payload["fixture"]["league_name"],
+            "country": payload["fixture"]["country"],
+            "home": payload["fixture"]["home"],
+            "away": payload["fixture"]["away"],
+            "decision": payload["decision"],
+            "level": payload["level"],
+            "level_name": payload["level_name"],
+            "side": payload["side"],
+            "odd": payload["odds_1x2"].get(payload["side"]) if payload.get("odds_1x2") and payload.get("side") else None,
+            "best_edge_value": payload["best_edge_value"],
+            "confluence_count": payload["confluence_count"],
+        })
+
+        if send_to_telegram:
+            message = summarize_1x2_signal(payload["fixture"], payload, payload["odds_1x2"])
+            telegram_data, telegram_status = send_telegram_message(message)
+            telegram_results.append({
+                "fixture_id": payload["fixture"]["fixture_id"],
+                "telegram_http_status": telegram_status,
+                "telegram_status": telegram_data,
+            })
+
+        if len(selected) >= MAX_SCAN_RESULTS:
+            break
+
+    selected.sort(key=lambda x: (-(x["level"]), -(x["best_edge_value"] or 0), x["kickoff_utc"] or ""))
+
+    return ok({
+        "status": "ok",
+        "date": date_str,
+        "min_level": min_level,
+        "count": len(selected),
+        "signals": selected,
+        "telegram_results": telegram_results,
+    })
+
+
+@app.route("/scan-goals")
+def scan_goals():
+    date_str = request.args.get("date", "").strip() or utc_today_str()
+    min_level_raw = request.args.get("min_level", "2").strip()
+    send_to_telegram = request.args.get("send_telegram", "0").strip() == "1"
+
+    if not min_level_raw.isdigit():
+        return err("min_level must be numeric", 400)
+
+    min_level = int(min_level_raw)
+    if min_level not in {1, 2, 3}:
+        return err("min_level must be 1, 2 or 3", 400)
+
+    data, status_code = get_fixtures_by_date(date_str)
+    if status_code != 200:
+        return ok(data, status_code)
+
+    fixtures = data["data"].get("response", [])
+    selected = []
+    telegram_results = []
+
+    for match in fixtures:
+        if not is_target_league_by_id(match):
+            continue
+        if not is_priority_fixture(match):
+            continue
+        if not is_pre_match_fixture(match):
+            continue
+
+        detail = build_fixture_detail(match)
+        payload, analyse_status = analyse_fixture_goals_core(str(detail["fixture_id"]))
+        if analyse_status != 200 or payload.get("status") != "ok":
+            continue
+        if payload.get("level", 0) < min_level:
+            continue
+
+        selected.append({
+            "fixture_id": payload["fixture"]["fixture_id"],
+            "kickoff_utc": payload["fixture"]["kickoff_utc"],
+            "league_name": payload["fixture"]["league_name"],
+            "country": payload["fixture"]["country"],
+            "home": payload["fixture"]["home"],
+            "away": payload["fixture"]["away"],
+            "decision": payload["decision"],
+            "level": payload["level"],
+            "level_name": payload["level_name"],
+            "market": payload["market"],
+            "confidence_count": payload["confidence_count"],
+        })
+
+        if send_to_telegram:
+            message = summarize_goals_signal(payload["fixture"], payload)
+            telegram_data, telegram_status = send_telegram_message(message)
+            telegram_results.append({
+                "fixture_id": payload["fixture"]["fixture_id"],
+                "telegram_http_status": telegram_status,
+                "telegram_status": telegram_data,
+            })
+
+        if len(selected) >= MAX_SCAN_RESULTS:
+            break
+
+    selected.sort(key=lambda x: (-(x["level"]), -(x["confidence_count"] or 0), x["kickoff_utc"] or ""))
+
+    return ok({
+        "status": "ok",
+        "date": date_str,
+        "min_level": min_level,
+        "count": len(selected),
+        "signals": selected,
+        "telegram_results": telegram_results,
+    })
 
 
 @app.route("/debug-fixture-value")
@@ -979,25 +1386,22 @@ def debug_fixture_value():
     fixture_id = request.args.get("fixture_id", "").strip()
 
     if not fixture_id:
-        return jsonify({"status": "error", "message": "Missing 'fixture_id' query parameter"}), 400
+        return err("Missing 'fixture_id' query parameter", 400)
     if not fixture_id.isdigit():
-        return jsonify({"status": "error", "message": "fixture_id must be numeric"}), 400
+        return err("fixture_id must be numeric", 400)
 
-    debug = {"fixture_id": fixture_id}
+    debug: Dict[str, Any] = {"fixture_id": fixture_id}
 
     fixture_data, fixture_status = get_fixture_by_id(fixture_id)
     debug["fixture_status"] = fixture_status
     debug["fixture_data_keys"] = list(fixture_data.keys())
 
     if fixture_status != 200:
-        return jsonify({"status": "ok", "debug": debug}), 200
+        return ok({"status": "ok", "debug": debug}, 200)
 
     match = fixture_data["fixture"]
-    detail = build_fixture_detail_summary(match)
-    teams = build_fixture_teams_info(match)
-
+    detail = build_fixture_detail(match)
     debug["detail"] = detail
-    debug["teams"] = teams
 
     standings_data, standings_status = call_api_football(
         "standings",
@@ -1008,12 +1412,8 @@ def debug_fixture_value():
     if standings_status == 200:
         standings_response = standings_data["data"].get("response", [])
         debug["standings_response_count"] = len(standings_response)
-
-        home_standing = find_team_standing(standings_response, teams["home_team_id"])
-        away_standing = find_team_standing(standings_response, teams["away_team_id"])
-
-        debug["home_standing_found"] = home_standing is not None
-        debug["away_standing_found"] = away_standing is not None
+        debug["home_standing_found"] = find_team_standing(standings_response, detail["home_team_id"]) is not None
+        debug["away_standing_found"] = find_team_standing(standings_response, detail["away_team_id"]) is not None
     else:
         debug["standings_error"] = standings_data
 
@@ -1023,22 +1423,18 @@ def debug_fixture_value():
     if odds_status == 200:
         odds_response = odds_data["data"].get("response", [])
         debug["odds_response_count"] = len(odds_response)
-
-        odds_summary = extract_odds_summary(odds_response)
-        debug["bookmaker_name"] = odds_summary.get("bookmaker_name")
-        debug["match_winner_found"] = odds_summary.get("match_winner") is not None
-        debug["markets_preview"] = odds_summary.get("markets_preview", [])
-
-        if odds_summary.get("match_winner"):
-            debug["match_winner_market"] = odds_summary["match_winner"]
-            debug["odds_1x2"] = extract_match_winner_odds(odds_summary["match_winner"])
+        debug["markets_preview"] = extract_markets_preview(odds_response)
+        market_pick = pick_best_1x2_market(odds_response, detail["home"], detail["away"])
+        debug["bookmaker_name"] = market_pick["bookmaker_name"]
+        debug["market_name"] = market_pick["bet_name"]
+        debug["odds_1x2"] = market_pick["odds_1x2"]
     else:
         debug["odds_error"] = odds_data
 
-    return jsonify({
+    return ok({
         "status": "ok",
         "debug": debug,
-    }), 200
+    })
 
 
 if __name__ == "__main__":
