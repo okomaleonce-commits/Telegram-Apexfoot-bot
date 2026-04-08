@@ -1,10 +1,10 @@
+
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify, request
-from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 
@@ -87,6 +87,15 @@ MIN_ODD_DRAW = 2.80
 MAX_ODD_MAIN_SIGNAL = 4.50
 MAX_SCAN_RESULTS = 20
 
+DEFAULT_SEND_TELEGRAM_SINGLE = True
+DEFAULT_SEND_TELEGRAM_SCAN = True
+BIG_FAVORITE_MAX_ODD = 1.55
+VERY_BIG_FAVORITE_MAX_ODD = 1.40
+BIG_FAVORITE_MIN_GF_AVG = 1.90
+VERY_BIG_FAVORITE_MIN_GF_AVG = 2.10
+BIG_FAVORITE_MIN_POINT_GAP = 12
+BIG_FAVORITE_MIN_RANK_GAP = 5
+
 
 # =========================
 # GENERIC
@@ -99,15 +108,6 @@ def err(message: str, status_code: int = 400, **kwargs):
     payload = {"status": "error", "message": message}
     payload.update(kwargs)
     return jsonify(payload), status_code
-
-
-@app.errorhandler(HTTPException)
-def handle_http_exception(e):
-    return jsonify({
-        "status": "error",
-        "message": e.name,
-        "details": e.description,
-    }), e.code
 
 
 @app.errorhandler(Exception)
@@ -124,9 +124,17 @@ def handle_exception(e):
 # =========================
 def send_telegram_message(text: str) -> Tuple[Dict[str, Any], int]:
     if not BOT_TOKEN:
-        return {"status": "error", "message": "BOT_TOKEN is missing"}, 500
+        return {
+            "status": "error",
+            "message": "BOT_TOKEN is missing",
+            "config": telegram_config_status(),
+        }, 500
     if not CHAT_ID:
-        return {"status": "error", "message": "CHAT_ID is missing"}, 500
+        return {
+            "status": "error",
+            "message": "CHAT_ID is missing",
+            "config": telegram_config_status(),
+        }, 500
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
@@ -136,12 +144,16 @@ def send_telegram_message(text: str) -> Tuple[Dict[str, Any], int]:
             json={"chat_id": CHAT_ID, "text": text},
             timeout=15,
         )
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw_text": response.text}
     except Exception as e:
         return {
             "status": "error",
             "message": "Telegram request failed",
             "details": str(e),
+            "config": telegram_config_status(),
         }, 500
 
     if not response.ok or not data.get("ok"):
@@ -149,9 +161,14 @@ def send_telegram_message(text: str) -> Tuple[Dict[str, Any], int]:
             "status": "error",
             "message": "Telegram API returned an error",
             "telegram_response": data,
-        }, 500
+            "config": telegram_config_status(),
+        }, response.status_code if response is not None else 500
 
-    return {"status": "ok", "telegram_response": data}, 200
+    return {
+        "status": "ok",
+        "telegram_response": data,
+        "config": telegram_config_status(),
+    }, 200
 
 
 # =========================
@@ -215,6 +232,19 @@ def format_match_time(iso_date: Optional[str]) -> Optional[str]:
     if not dt:
         return iso_date
     return dt.astimezone(timezone.utc).strftime("%H:%M UTC")
+
+
+def parse_bool_param(raw_value: Optional[str], default: bool) -> bool:
+    if raw_value is None or str(raw_value).strip() == "":
+        return default
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def telegram_config_status() -> Dict[str, Any]:
+    return {
+        "bot_token_present": bool(BOT_TOKEN),
+        "chat_id_present": bool(CHAT_ID),
+    }
 
 
 def is_priority_fixture(match: Dict[str, Any]) -> bool:
@@ -750,6 +780,95 @@ def build_goals_context(home_standing: Optional[Dict[str, Any]], away_standing: 
     }
 
 
+def build_match_context(home_standing: Optional[Dict[str, Any]], away_standing: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "home_rank": home_standing["rank"] if home_standing else None,
+        "away_rank": away_standing["rank"] if away_standing else None,
+        "home_points": home_standing["points"] if home_standing else None,
+        "away_points": away_standing["points"] if away_standing else None,
+        "home_form": home_standing["form"] if home_standing else None,
+        "away_form": away_standing["form"] if away_standing else None,
+        "home_goals_for": home_standing["goals_for"] if home_standing else None,
+        "home_goals_against": home_standing["goals_against"] if home_standing else None,
+        "away_goals_for": away_standing["goals_for"] if away_standing else None,
+        "away_goals_against": away_standing["goals_against"] if away_standing else None,
+        "home_played": home_standing["played"] if home_standing else None,
+        "away_played": away_standing["played"] if away_standing else None,
+    }
+
+
+def detect_big_favorite_side(odds_1x2: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[float]]:
+    if not odds_1x2:
+        return None, None
+
+    try:
+        home_odd = float(odds_1x2["Home"]) if odds_1x2.get("Home") else None
+    except Exception:
+        home_odd = None
+    try:
+        away_odd = float(odds_1x2["Away"]) if odds_1x2.get("Away") else None
+    except Exception:
+        away_odd = None
+
+    if home_odd is not None and home_odd <= BIG_FAVORITE_MAX_ODD and (away_odd is None or home_odd < away_odd):
+        return "Home", home_odd
+    if away_odd is not None and away_odd <= BIG_FAVORITE_MAX_ODD and (home_odd is None or away_odd < home_odd):
+        return "Away", away_odd
+
+    return None, None
+
+
+def compute_under_big_favorite_penalty(
+    context: Optional[Dict[str, Any]],
+    goals_context: Dict[str, Any],
+    odds_1x2: Optional[Dict[str, Any]],
+) -> Tuple[int, List[str]]:
+    favorite_side, favorite_odd = detect_big_favorite_side(odds_1x2)
+    if favorite_side is None or favorite_odd is None or not context:
+        return 0, []
+
+    home_gf_avg = safe_div(goals_context.get("home_goals_for"), goals_context.get("home_played"))
+    away_gf_avg = safe_div(goals_context.get("away_goals_for"), goals_context.get("away_played"))
+
+    if favorite_side == "Home":
+        favorite_gf_avg = home_gf_avg
+        rank_gap = None
+        points_gap = None
+        if context.get("home_rank") is not None and context.get("away_rank") is not None:
+            rank_gap = context["away_rank"] - context["home_rank"]
+        if context.get("home_points") is not None and context.get("away_points") is not None:
+            points_gap = context["home_points"] - context["away_points"]
+    else:
+        favorite_gf_avg = away_gf_avg
+        rank_gap = None
+        points_gap = None
+        if context.get("home_rank") is not None and context.get("away_rank") is not None:
+            rank_gap = context["home_rank"] - context["away_rank"]
+        if context.get("home_points") is not None and context.get("away_points") is not None:
+            points_gap = context["away_points"] - context["home_points"]
+
+    penalty = 0
+    reasons: List[str] = []
+
+    if favorite_gf_avg is not None and favorite_gf_avg >= BIG_FAVORITE_MIN_GF_AVG and favorite_odd <= BIG_FAVORITE_MAX_ODD:
+        penalty += 2
+        reasons.append("Blocage UNDER : gros favori avec forte capacité offensive.")
+
+    if points_gap is not None and points_gap >= BIG_FAVORITE_MIN_POINT_GAP:
+        penalty += 1
+        reasons.append("Écart de points trop large pour un under principal propre.")
+
+    if rank_gap is not None and rank_gap >= BIG_FAVORITE_MIN_RANK_GAP:
+        penalty += 1
+        reasons.append("Écart de niveau trop large : risque de 3-0 / 4-0.")
+
+    if favorite_gf_avg is not None and favorite_gf_avg >= VERY_BIG_FAVORITE_MIN_GF_AVG and favorite_odd <= VERY_BIG_FAVORITE_MAX_ODD:
+        penalty += 2
+        reasons.append("Très gros favori capable de couvrir l'over seul.")
+
+    return min(penalty, 5), reasons[:4]
+
+
 def goals_level_from_confidence(confidence_count: int) -> int:
     if confidence_count >= LEVELS_GOALS[3]["confidence_min"]:
         return 3
@@ -764,9 +883,12 @@ def build_goals_value_decision_3_levels(
     goals_context: Dict[str, Any],
     btts_market: Optional[Dict[str, Any]],
     ou25_market: Optional[Dict[str, Any]],
+    context: Optional[Dict[str, Any]] = None,
+    odds_1x2: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     rationale: List[str] = []
     decision = "NO_BET"
+    guard_notes: List[str] = []
 
     home_gf_avg = safe_div(goals_context["home_goals_for"], goals_context["home_played"])
     away_gf_avg = safe_div(goals_context["away_goals_for"], goals_context["away_played"])
@@ -817,12 +939,12 @@ def build_goals_value_decision_3_levels(
             if level_yes > best_level or (level_yes == best_level and confidence_yes > best_confidence):
                 best_level = level_yes
                 best_confidence = confidence_yes
-                best_market = ("BTTS_YES", yes_odd, confidence_yes)
+                best_market = ("BTTS_YES", yes_odd, confidence_yes, [])
 
             if level_no > best_level or (level_no == best_level and confidence_no > best_confidence):
                 best_level = level_no
                 best_confidence = confidence_no
-                best_market = ("BTTS_NO", no_odd, confidence_no)
+                best_market = ("BTTS_NO", no_odd, confidence_no, [])
 
     if ou25_market:
         over_odd = ou25_market["values"].get("Over 2.5")
@@ -849,18 +971,22 @@ def build_goals_value_decision_3_levels(
             if away_gf_avg is not None and away_gf_avg >= 1.80 and home_ga_avg is not None and home_ga_avg >= 1.30:
                 confidence_under = max(confidence_under - 2, 0)
 
+            under_penalty, under_penalty_notes = compute_under_big_favorite_penalty(context, goals_context, odds_1x2)
+            if under_penalty > 0:
+                confidence_under = max(confidence_under - under_penalty, 0)
+
             level_over = goals_level_from_confidence(confidence_over) if float(over_odd) >= 1.70 else 0
             level_under = goals_level_from_confidence(confidence_under) if float(under_odd) >= 1.70 else 0
 
             if level_over > best_level or (level_over == best_level and confidence_over > best_confidence):
                 best_level = level_over
                 best_confidence = confidence_over
-                best_market = ("OVER_2_5", over_odd, confidence_over)
+                best_market = ("OVER_2_5", over_odd, confidence_over, [])
 
             if level_under > best_level or (level_under == best_level and confidence_under > best_confidence):
                 best_level = level_under
                 best_confidence = confidence_under
-                best_market = ("UNDER_2_5", under_odd, confidence_under)
+                best_market = ("UNDER_2_5", under_odd, confidence_under, under_penalty_notes)
 
     if not best_market or best_level == 0:
         rationale.append("Les marchés buts ne montrent pas un avantage net.")
@@ -878,7 +1004,9 @@ def build_goals_value_decision_3_levels(
             "away_ga_avg": away_ga_avg,
         }
 
-    market_name, selected_odd, confidence_count = best_market
+    market_name, selected_odd, confidence_count, market_notes = best_market
+    if market_name == "UNDER_2_5":
+        guard_notes.extend(market_notes)
 
     if market_name == "BTTS_YES":
         decision = ["", "WATCH_BTTS_YES", "VALUE_BTTS_YES", "MAIN_BTTS_YES"][best_level]
@@ -897,6 +1025,8 @@ def build_goals_value_decision_3_levels(
         rationale.append("Marché buts avec assez de confluence pour une vraie value.")
     else:
         rationale.append("Signal principal sur les buts: forte cohérence du profil statistique.")
+
+    rationale.extend(guard_notes)
 
     return {
         "decision": decision,
@@ -970,18 +1100,7 @@ def analyse_fixture_value_core(fixture_id: str) -> Tuple[Dict[str, Any], int]:
     home_standing = find_team_standing(standings_response, detail["home_team_id"])
     away_standing = find_team_standing(standings_response, detail["away_team_id"])
 
-    context = {
-        "home_rank": home_standing["rank"] if home_standing else None,
-        "away_rank": away_standing["rank"] if away_standing else None,
-        "home_points": home_standing["points"] if home_standing else None,
-        "away_points": away_standing["points"] if away_standing else None,
-        "home_form": home_standing["form"] if home_standing else None,
-        "away_form": away_standing["form"] if away_standing else None,
-        "home_goals_for": home_standing["goals_for"] if home_standing else None,
-        "home_goals_against": home_standing["goals_against"] if home_standing else None,
-        "away_goals_for": away_standing["goals_for"] if away_standing else None,
-        "away_goals_against": away_standing["goals_against"] if away_standing else None,
-    }
+    context = build_match_context(home_standing, away_standing)
 
     odds_data, odds_status = call_api_football("odds", {"fixture": fixture_id})
     if odds_status != 200:
@@ -1080,6 +1199,7 @@ def analyse_fixture_goals_core(fixture_id: str) -> Tuple[Dict[str, Any], int]:
     home_standing = find_team_standing(standings_response, detail["home_team_id"])
     away_standing = find_team_standing(standings_response, detail["away_team_id"])
     goals_context = build_goals_context(home_standing, away_standing)
+    context = build_match_context(home_standing, away_standing)
 
     odds_data, odds_status = call_api_football("odds", {"fixture": fixture_id})
     if odds_status != 200:
@@ -1094,6 +1214,9 @@ def analyse_fixture_goals_core(fixture_id: str) -> Tuple[Dict[str, Any], int]:
             "message": "No odds found for this fixture",
         }, 200
 
+    market_pick = pick_best_1x2_market(odds_response, detail["home"], detail["away"])
+    odds_1x2 = market_pick["odds_1x2"]
+
     btts_market = find_market_values_any_bookmaker(
         odds_response,
         ["Both Teams Score", "Both Teams To Score"],
@@ -1106,12 +1229,22 @@ def analyse_fixture_goals_core(fixture_id: str) -> Tuple[Dict[str, Any], int]:
         accepted_labels=["Over 2.5", "Under 2.5"],
     )
 
-    decision_data = build_goals_value_decision_3_levels(goals_context, btts_market, ou25_market)
+    decision_data = build_goals_value_decision_3_levels(
+        goals_context,
+        btts_market,
+        ou25_market,
+        context=context,
+        odds_1x2=odds_1x2,
+    )
 
     return {
         "status": "ok",
         "fixture": detail,
+        "context": context,
         "goals_context": goals_context,
+        "bookmaker_name": market_pick["bookmaker_name"],
+        "market_name": market_pick["bet_name"],
+        "odds_1x2": odds_1x2,
         "btts_market": btts_market,
         "over_under_2_5_market": ou25_market,
         "level": decision_data["level"],
@@ -1143,7 +1276,6 @@ def home():
             "/fixture-goals-value?fixture_id=...",
             "/debug-fixture-value?fixture_id=...",
             "/fixtures-today",
-            "/fixtures-prematch-ready",
             "/scan-value",
             "/scan-goals",
         ],
@@ -1159,8 +1291,19 @@ def ping():
     })
 
 
+@app.route("/telegram-test")
+def telegram_test():
+    text_message = request.args.get("text", "").strip() or f"Test Telegram Apexfoot OK - {now_utc().isoformat()}"
+    telegram_data, telegram_status = send_telegram_message(text_message)
+    return ok({
+        "status": "ok" if telegram_status == 200 else "error",
+        "message_sent": telegram_status == 200,
+        "telegram_http_status": telegram_status,
+        "telegram_status": telegram_data,
+    }, 200 if telegram_status == 200 else telegram_status)
+
+
 @app.route("/fixtures-today")
-@app.route("/fixtures-prematch-ready")
 def fixtures_today():
     date_str = request.args.get("date", "").strip() or utc_today_str()
     data, status_code = get_fixtures_by_date(date_str)
@@ -1202,7 +1345,7 @@ def fixtures_today():
 @app.route("/fixture-value")
 def fixture_value():
     fixture_id = request.args.get("fixture_id", "").strip()
-    send_to_telegram = request.args.get("send_telegram", "1").strip() == "1"
+    send_to_telegram = parse_bool_param(request.args.get("send_telegram"), DEFAULT_SEND_TELEGRAM_SINGLE)
 
     if not fixture_id:
         return err("Missing 'fixture_id' query parameter", 400)
@@ -1224,7 +1367,7 @@ def fixture_value():
 @app.route("/fixture-goals-value")
 def fixture_goals_value():
     fixture_id = request.args.get("fixture_id", "").strip()
-    send_to_telegram = request.args.get("send_telegram", "1").strip() == "1"
+    send_to_telegram = parse_bool_param(request.args.get("send_telegram"), DEFAULT_SEND_TELEGRAM_SINGLE)
 
     if not fixture_id:
         return err("Missing 'fixture_id' query parameter", 400)
@@ -1247,7 +1390,7 @@ def fixture_goals_value():
 def scan_value():
     date_str = request.args.get("date", "").strip() or utc_today_str()
     min_level_raw = request.args.get("min_level", "2").strip()
-    send_to_telegram = request.args.get("send_telegram", "0").strip() == "1"
+    send_to_telegram = parse_bool_param(request.args.get("send_telegram"), DEFAULT_SEND_TELEGRAM_SCAN)
 
     if not min_level_raw.isdigit():
         return err("min_level must be numeric", 400)
@@ -1309,12 +1452,21 @@ def scan_value():
 
     selected.sort(key=lambda x: (-(x["level"]), -(x["best_edge_value"] or 0), x["kickoff_utc"] or ""))
 
+    if send_to_telegram and not selected:
+        telegram_results.append({
+            "status": "info",
+            "message": "Aucun signal à envoyer pour ce scan.",
+            "config": telegram_config_status(),
+        })
+
     return ok({
         "status": "ok",
         "date": date_str,
         "min_level": min_level,
         "count": len(selected),
         "signals": selected,
+        "telegram_enabled": send_to_telegram,
+        "telegram_config": telegram_config_status(),
         "telegram_results": telegram_results,
     })
 
@@ -1323,7 +1475,7 @@ def scan_value():
 def scan_goals():
     date_str = request.args.get("date", "").strip() or utc_today_str()
     min_level_raw = request.args.get("min_level", "2").strip()
-    send_to_telegram = request.args.get("send_telegram", "0").strip() == "1"
+    send_to_telegram = parse_bool_param(request.args.get("send_telegram"), DEFAULT_SEND_TELEGRAM_SCAN)
 
     if not min_level_raw.isdigit():
         return err("min_level must be numeric", 400)
@@ -1383,12 +1535,21 @@ def scan_goals():
 
     selected.sort(key=lambda x: (-(x["level"]), -(x["confidence_count"] or 0), x["kickoff_utc"] or ""))
 
+    if send_to_telegram and not selected:
+        telegram_results.append({
+            "status": "info",
+            "message": "Aucun signal à envoyer pour ce scan.",
+            "config": telegram_config_status(),
+        })
+
     return ok({
         "status": "ok",
         "date": date_str,
         "min_level": min_level,
         "count": len(selected),
         "signals": selected,
+        "telegram_enabled": send_to_telegram,
+        "telegram_config": telegram_config_status(),
         "telegram_results": telegram_results,
     })
 
