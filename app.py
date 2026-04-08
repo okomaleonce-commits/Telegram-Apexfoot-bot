@@ -216,6 +216,23 @@ def build_fixture_detail(match):
     }
 
 
+def build_fixture_detail_summary(match):
+    detail = build_fixture_detail(match)
+    return {
+        "fixture_id": detail["fixture_id"],
+        "home": detail["home"],
+        "away": detail["away"],
+        "league_id": detail["league_id"],
+        "league_name": detail["league_name"],
+        "country": detail["country"],
+        "season": detail["season"],
+        "round": detail["round"],
+        "date": detail["date"],
+        "status_short": detail["status_short"],
+        "status_long": detail["status_long"],
+    }
+
+
 def build_fixture_teams_info(match):
     league = match.get("league", {})
     teams = match.get("teams", {})
@@ -389,22 +406,10 @@ def safe_div(a, b):
     return a / b
 
 
-def avg_goals_for(goals_for, played):
-    return safe_div(goals_for, played)
-
-
-def avg_goals_against(goals_against, played):
-    return safe_div(goals_against, played)
-
-
 def build_model_probabilities(context):
-    """
-    Modèle simple et prudent.
-    Produit des probabilités maison grossières pour comparer au marché.
-    """
-    home_score = 0.0
-    away_score = 0.0
-    draw_score = 0.0
+    home_score = 1.0
+    draw_score = 0.8
+    away_score = 1.0
 
     home_rank = context.get("home_rank")
     away_rank = context.get("away_rank")
@@ -417,12 +422,6 @@ def build_model_probabilities(context):
     home_goals_against = context.get("home_goals_against")
     away_goals_against = context.get("away_goals_against")
 
-    # Base
-    home_score += 1.0
-    away_score += 1.0
-    draw_score += 0.80
-
-    # Classement
     if home_rank is not None and away_rank is not None:
         rank_gap = away_rank - home_rank
         if rank_gap >= 4:
@@ -436,7 +435,6 @@ def build_model_probabilities(context):
         else:
             draw_score += 0.20
 
-    # Points
     if home_points is not None and away_points is not None:
         point_gap = home_points - away_points
         if point_gap >= 8:
@@ -450,7 +448,6 @@ def build_model_probabilities(context):
         else:
             draw_score += 0.10
 
-    # Forme
     home_wins = count_wins(home_form)
     away_wins = count_wins(away_form)
     if home_wins >= away_wins + 2:
@@ -460,14 +457,12 @@ def build_model_probabilities(context):
     else:
         draw_score += 0.10
 
-    # Attaque
     if home_goals_for is not None and away_goals_for is not None:
         if home_goals_for >= away_goals_for + 8:
             home_score += 0.20
         elif away_goals_for >= home_goals_for + 8:
             away_score += 0.20
 
-    # Défense
     if home_goals_against is not None and away_goals_against is not None:
         if away_goals_against >= home_goals_against + 8:
             home_score += 0.20
@@ -476,11 +471,10 @@ def build_model_probabilities(context):
 
     raw = {"Home": home_score, "Draw": draw_score, "Away": away_score}
     total = sum(raw.values())
-    normalized = {k: v / total for k, v in raw.items()}
 
     return {
         "raw_scores": raw,
-        "normalized_probabilities": normalized,
+        "normalized_probabilities": {k: v / total for k, v in raw.items()},
     }
 
 
@@ -501,25 +495,15 @@ def best_edge(edges):
     return best_key, candidates[best_key]
 
 
-def build_value_decision_with_edge(
-    detail,
-    context,
-    odds_1x2,
-    market_probs,
-    model_probs,
-    edges,
-):
-    status_short = detail.get("status_short")
-    if is_live_or_not_prematch(status_short):
+def build_value_decision_with_edge(detail, odds_1x2, model_probs, market_probs, edges):
+    if is_live_or_not_prematch(detail.get("status_short")):
         return {
             "decision": "NO_BET",
             "rationale": ["Le match n'est plus en pré-match."],
             "best_edge_label": None,
             "best_edge_value": None,
-            "blocked": True,
         }
 
-    # Cotes trop faibles = on bloque
     try:
         away_odd = float(odds_1x2["Away"]) if odds_1x2.get("Away") else None
         home_odd = float(odds_1x2["Home"]) if odds_1x2.get("Home") else None
@@ -530,19 +514,17 @@ def build_value_decision_with_edge(
     if away_odd is not None and away_odd < 1.60:
         return {
             "decision": "NO_BET",
-            "rationale": ["Cote away trop basse (< 1.60) : risque de favori surpayé."],
+            "rationale": ["Cote away trop basse (< 1.60) : favori déjà trop pricé."],
             "best_edge_label": None,
             "best_edge_value": None,
-            "blocked": True,
         }
 
     if home_odd is not None and home_odd < 1.60:
         return {
             "decision": "NO_BET",
-            "rationale": ["Cote home trop basse (< 1.60) : risque de favori surpayé."],
+            "rationale": ["Cote home trop basse (< 1.60) : favori déjà trop pricé."],
             "best_edge_label": None,
             "best_edge_value": None,
-            "blocked": True,
         }
 
     edge_label, edge_value = best_edge(edges)
@@ -551,36 +533,32 @@ def build_value_decision_with_edge(
         return {
             "decision": "NO_BET",
             "rationale": ["Impossible de calculer un edge exploitable."],
-            "best_edge_label": edge_label,
-            "best_edge_value": edge_value,
-            "blocked": False,
+            "best_edge_label": None,
+            "best_edge_value": None,
         }
 
-    # Seuil minimum d'edge
     if edge_value < 0.05:
         return {
             "decision": "NO_BET",
             "rationale": ["Best edge < 5% : pas d'avantage suffisant contre le marché."],
             "best_edge_label": edge_label,
             "best_edge_value": edge_value,
-            "blocked": False,
         }
 
-    label_to_decision = {
+    label_map = {
         "Home": "VALUE_HOME",
         "Draw": "VALUE_DRAW",
         "Away": "VALUE_AWAY",
     }
 
     return {
-        "decision": label_to_decision.get(edge_label, "NO_BET"),
+        "decision": label_map.get(edge_label, "NO_BET"),
         "rationale": [
             f"Edge positif sur {edge_label}.",
             f"Best edge = {round(edge_value * 100, 2)}%.",
         ],
         "best_edge_label": edge_label,
         "best_edge_value": edge_value,
-        "blocked": False,
     }
 
 
@@ -601,10 +579,10 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
     rationale = []
     decision = "NO_BET"
 
-    home_gf_avg = avg_goals_for(goals_context["home_goals_for"], goals_context["home_played"])
-    away_gf_avg = avg_goals_for(goals_context["away_goals_for"], goals_context["away_played"])
-    home_ga_avg = avg_goals_against(goals_context["home_goals_against"], goals_context["home_played"])
-    away_ga_avg = avg_goals_against(goals_context["away_goals_against"], goals_context["away_played"])
+    home_gf_avg = safe_div(goals_context["home_goals_for"], goals_context["home_played"])
+    away_gf_avg = safe_div(goals_context["away_goals_for"], goals_context["away_played"])
+    home_ga_avg = safe_div(goals_context["home_goals_against"], goals_context["home_played"])
+    away_ga_avg = safe_div(goals_context["away_goals_against"], goals_context["away_played"])
 
     attack_signal = 0
     concede_signal = 0
@@ -707,6 +685,11 @@ def build_goals_value_decision(goals_context, btts_market, ou25_market):
 # =========================
 # ROUTES
 # =========================
+@app.route("/")
+def home():
+    return "Bot running"
+
+
 @app.route("/health")
 def health():
     return jsonify({
@@ -859,10 +842,9 @@ def fixture_value():
 
     decision_data = build_value_decision_with_edge(
         detail=detail,
-        context=context,
         odds_1x2=odds_1x2,
-        market_probs=market_implied_normalized,
         model_probs=model_probs,
+        market_probs=market_implied_normalized,
         edges=edges,
     )
 
