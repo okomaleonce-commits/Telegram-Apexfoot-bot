@@ -3,12 +3,14 @@ import os
 import re
 import time
 import math
+import threading
 import unicodedata
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import schedule
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
 
@@ -25,6 +27,7 @@ API_KEY = os.environ.get("API_KEY")
 FOOTYSTATS_KEY = os.environ.get("FOOTYSTATS_KEY")
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 ODDS_API_BOOKMAKERS = os.environ.get("ODDS_API_BOOKMAKERS", "bet365,unibet")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 FOOTYSTATS_BASE_URL = "https://api.football-data-api.com"
@@ -61,6 +64,10 @@ LEVELS_GOALS = {
 MIN_ODD_HOME_AWAY = 1.60
 MIN_ODD_DRAW = 2.80
 MAX_ODD_MAIN_SIGNAL = 4.50
+SCAN_START_HOUR = 7   # UTC == heure locale Abidjan (GMT+0)
+SCAN_END_HOUR = 23
+MIN_SIGNAL_LEVEL_AUTO = 2  # Niveau minimum pour envoi auto Telegram
+
 MAX_SCAN_RESULTS = 20
 
 # teams that often create fake glamour-away value when the model is too naive
@@ -1632,6 +1639,176 @@ def summarize_goals_signal(detail: Dict[str, Any], analysis: Dict[str, Any]) -> 
 
 
 # ============================================================
+# SCHEDULER — scan toutes les heures de 07h00 à 23h00 UTC
+# ============================================================
+def run_full_scan_job():
+    """Lance automatiquement le scan 1X2 + Buts/BTTS si dans la plage horaire."""
+    hour = now_utc().hour
+    if not (SCAN_START_HOUR <= hour <= SCAN_END_HOUR):
+        return  # Hors plage, on dort
+
+    date_str = utc_today_str()
+    timestamp = now_utc().strftime("%H:%M UTC")
+
+    fixtures_data, fixtures_status = get_fixtures_by_date(date_str)
+    if fixtures_status != 200:
+        send_telegram_message(f"⚠️ Scan {timestamp} — Impossible de récupérer les matchs.")
+        return
+
+    fixtures = fixtures_data["data"].get("response", [])
+    footy_matches = None
+    if FOOTYSTATS_KEY:
+        footy_payload, footy_status = get_footystats_matches_by_date(date_str)
+        if footy_status == 200:
+            footy_matches = footystats_data_as_list(footy_payload["data"])
+
+    signals_sent = 0
+
+    for match in fixtures:
+        if not is_target_league_by_id(match):
+            continue
+        if not is_priority_fixture(match):
+            continue
+        if not is_pre_match_fixture(match):
+            continue
+
+        detail = build_fixture_detail(match)
+        fixture_id = str(detail["fixture_id"])
+
+        # --- 1X2 ---
+        try:
+            a1x2, s1x2 = analyse_fixture_value_core(fixture_id, preloaded_footy_matches=footy_matches)
+            if s1x2 == 200 and a1x2.get("decision") != "NO_BET" and (a1x2.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
+                send_telegram_message(summarize_1x2_signal(a1x2["fixture"], a1x2, a1x2["odds_1x2"]))
+                signals_sent += 1
+        except Exception:
+            pass
+
+        # --- GOALS / BTTS ---
+        try:
+            agoals, sgoals = analyse_fixture_goals_core(fixture_id, preloaded_footy_matches=footy_matches)
+            if sgoals == 200 and agoals.get("decision") != "NO_BET" and (agoals.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
+                send_telegram_message(summarize_goals_signal(agoals["fixture"], agoals))
+                signals_sent += 1
+        except Exception:
+            pass
+
+        if signals_sent >= MAX_SCAN_RESULTS:
+            break
+
+    if signals_sent == 0:
+        send_telegram_message(
+            f"🔍 Scan automatique {date_str} {timestamp}\n"
+            f"Aucun signal VALUE/MAIN détecté sur les ligues surveillées."
+        )
+
+
+def _scheduler_loop():
+    schedule.every().hour.at(":00").do(run_full_scan_job)
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+# Lancement du scheduler en thread daemon
+threading.Thread(target=_scheduler_loop, daemon=True, name="ApexScheduler").start()
+
+
+# ============================================================
+# TELEGRAM WEBHOOK
+# ============================================================
+def set_telegram_webhook(url: str) -> Tuple[Dict[str, Any], int]:
+    if not BOT_TOKEN:
+        return {"status": "error", "message": "BOT_TOKEN is missing"}, 500
+    params: Dict[str, Any] = {"url": url}
+    if WEBHOOK_SECRET:
+        params["secret_token"] = WEBHOOK_SECRET
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+            json=params,
+            timeout=15,
+        )
+        return {"status": "ok", "telegram_response": r.json()}, 200
+    except Exception as exc:
+        return {"status": "error", "details": str(exc)}, 500
+
+
+def _handle_telegram_command(cmd: str) -> None:
+    """Traite une commande Telegram reçue via webhook."""
+    if cmd == "/scan":
+        send_telegram_message(
+            "🔍 Scan lancé manuellement...\n"
+            "Analyse 1X2 + Buts + BTTS en cours. Résultats dans quelques instants."
+        )
+        threading.Thread(target=run_full_scan_job, daemon=True).start()
+
+    elif cmd == "/status":
+        send_telegram_message(
+            f"✅ APEX-SIRIUS BOT ACTIF\n\n"
+            f"🔧 Build: {BUILD_ID}\n"
+            f"🕐 Heure UTC: {now_utc().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"API-Football : {'✅' if API_KEY else '❌ MANQUANT'}\n"
+            f"FootyStats   : {'✅' if FOOTYSTATS_KEY else '❌ MANQUANT'}\n"
+            f"Odds API     : {'✅' if ODDS_API_KEY else '❌ MANQUANT'}\n"
+            f"Telegram     : ✅\n\n"
+            f"⏰ Scheduler : toutes les heures, {SCAN_START_HOUR}h00–{SCAN_END_HOUR}h00 UTC\n"
+            f"📚 Bookmakers : {ODDS_API_BOOKMAKERS}"
+        )
+
+    elif cmd == "/ping":
+        send_telegram_message(f"🏓 Pong! Bot actif — {now_utc().strftime('%H:%M')} UTC")
+
+    elif cmd == "/help":
+        send_telegram_message(
+            "📋 Commandes disponibles :\n\n"
+            "/scan — Lance un scan complet (1X2 + Buts + BTTS)\n"
+            "/status — État du bot et des APIs\n"
+            "/ping — Test de connexion\n"
+            "/help — Cette aide\n\n"
+            f"⏰ Scan automatique toutes les heures de {SCAN_START_HOUR}h00 à {SCAN_END_HOUR}h00 UTC"
+        )
+
+
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    # Vérification du secret header si configuré
+    if WEBHOOK_SECRET:
+        incoming = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if incoming != WEBHOOK_SECRET:
+            return jsonify({"status": "forbidden"}), 403
+
+    update = request.get_json(silent=True) or {}
+    message = update.get("message") or update.get("channel_post") or {}
+    text = (message.get("text") or "").strip()
+    chat_id = str(message.get("chat", {}).get("id") or "")
+
+    if not text or not chat_id:
+        return ok({"status": "ok", "ignored": True})
+
+    # Supprime la mention @bot si présente
+    cmd = text.split()[0].lower().split("@")[0]
+    _handle_telegram_command(cmd)
+
+    return ok({"status": "ok"})
+
+
+@app.route("/set-webhook")
+def set_webhook_route():
+    """Active le webhook Telegram — appelle cette route une fois après déploiement."""
+    webhook_url = request.args.get("url", "").strip()
+    if not webhook_url:
+        # Auto-détection de l'URL publique
+        webhook_url = request.url_root.rstrip("/") + "/webhook"
+    payload, status = set_telegram_webhook(webhook_url)
+    return ok({
+        "status": "ok" if status == 200 else "error",
+        "webhook_url": webhook_url,
+        "result": payload,
+    }, status)
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 @app.route("/")
@@ -1642,6 +1819,7 @@ def home():
         "routes": [
             "/", "/version", "/ping", "/telegram-test",
             "/footystats-test", "/odds-api-test?sport=soccer_epl",
+            "/set-webhook", "/webhook (POST)",
             "/fixtures-today", "/fixtures-prematch-ready",
             "/fixture-value?fixture_id=...",
             "/fixture-goals-value?fixture_id=...",
