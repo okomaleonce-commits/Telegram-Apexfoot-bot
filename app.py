@@ -1711,60 +1711,76 @@ def summarize_goals_signal(detail: Dict[str, Any], analysis: Dict[str, Any]) -> 
 # SQLITE / JOURNALISATION / BACKTEST
 # ============================================================
 def db_connect() -> sqlite3.Connection:
+    # Crée le répertoire parent si nécessaire (ex: /data non encore monté)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Cannot create DB dir %s: %s — falling back to /tmp", db_dir, exc)
+            # Fallback sur /tmp si le disk n'est pas monté
+            fallback = os.path.join("/tmp", os.path.basename(DB_PATH))
+            conn = sqlite3.connect(fallback, timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            return conn
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db() -> None:
-    with closing(db_connect()) as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_uid TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL,
-            build_id TEXT NOT NULL,
-            fixture_id INTEGER NOT NULL,
-            match_date TEXT,
-            kickoff_utc TEXT,
-            league_id INTEGER,
-            league_name TEXT,
-            country TEXT,
-            home_team TEXT,
-            away_team TEXT,
-            market TEXT,
-            side TEXT,
-            decision TEXT NOT NULL,
-            level INTEGER NOT NULL,
-            level_name TEXT,
-            odd REAL,
-            raw_edge REAL,
-            adjusted_edge REAL,
-            confluence_count INTEGER,
-            confidence_count INTEGER,
-            rationale TEXT,
-            contextual_flags TEXT,
-            contextual_penalties TEXT,
-            telegram_sent INTEGER DEFAULT 0,
-            telegram_http_status INTEGER,
-            telegram_message_id TEXT,
-            result_status TEXT DEFAULT 'pending',
-            match_status TEXT,
-            home_goals INTEGER,
-            away_goals INTEGER,
-            bet_outcome TEXT,
-            stake REAL DEFAULT 1.0,
-            profit REAL DEFAULT 0.0,
-            resolved_at TEXT
-        )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_fixture_id ON signals(fixture_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_result_status ON signals(result_status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_level ON signals(level)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_build_id ON signals(build_id)")
-        conn.commit()
+    try:
+        with closing(db_connect()) as conn:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_uid TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                build_id TEXT NOT NULL,
+                fixture_id INTEGER NOT NULL,
+                match_date TEXT,
+                kickoff_utc TEXT,
+                league_id INTEGER,
+                league_name TEXT,
+                country TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                market TEXT,
+                side TEXT,
+                decision TEXT NOT NULL,
+                level INTEGER NOT NULL,
+                level_name TEXT,
+                odd REAL,
+                raw_edge REAL,
+                adjusted_edge REAL,
+                confluence_count INTEGER,
+                confidence_count INTEGER,
+                rationale TEXT,
+                contextual_flags TEXT,
+                contextual_penalties TEXT,
+                telegram_sent INTEGER DEFAULT 0,
+                telegram_http_status INTEGER,
+                telegram_message_id TEXT,
+                result_status TEXT DEFAULT 'pending',
+                match_status TEXT,
+                home_goals INTEGER,
+                away_goals INTEGER,
+                bet_outcome TEXT,
+                stake REAL DEFAULT 1.0,
+                profit REAL DEFAULT 0.0,
+                resolved_at TEXT
+            )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_fixture_id ON signals(fixture_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_result_status ON signals(result_status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_level ON signals(level)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_build_id ON signals(build_id)")
+            conn.commit()
+            logger.info("DB ready at %s", DB_PATH)
+    except Exception as exc:
+        logger.error("init_db failed: %s — bot will start but DB may be unavailable", exc)
 
 
 def json_dumps_safe(value: Any) -> str:
