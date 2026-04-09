@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import schedule
 from flask import Flask, jsonify, request
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
@@ -41,11 +43,27 @@ AUTO_RESOLVE_ENABLED = os.environ.get("AUTO_RESOLVE_ENABLED", "1") == "1"
 DEFAULT_STAKE = float(os.environ.get("DEFAULT_STAKE", "1.0"))
 RESOLVE_BATCH_LIMIT = int(os.environ.get("RESOLVE_BATCH_LIMIT", "200"))
 
+ENABLE_SCHEDULER = os.environ.get("ENABLE_SCHEDULER", "1") == "1"
+SCAN_COOLDOWN_SECONDS = int(os.environ.get("SCAN_COOLDOWN_SECONDS", "120"))
+HTTP_RETRY_TOTAL = int(os.environ.get("HTTP_RETRY_TOTAL", "3"))
+HTTP_BACKOFF_FACTOR = float(os.environ.get("HTTP_BACKOFF_FACTOR", "0.7"))
+
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("apexbot")
+
+SCAN_LOCK = threading.Lock()
+SCAN_STATE: Dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "last_success": None,
+    "last_error": None,
+    "last_duration_seconds": None,
+    "last_signals_sent": 0,
+    "last_manual_trigger_at": None,
+}
 
 API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 FOOTYSTATS_BASE_URL = "https://api.football-data-api.com"
@@ -96,6 +114,29 @@ GLAMOUR_NAMES = {
 }
 
 _MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+# ============================================================
+# HTTP SESSION PARTAGÉE (retry + backoff)
+# ============================================================
+def build_http_session() -> requests.Session:
+    retry = Retry(
+        total=HTTP_RETRY_TOTAL,
+        connect=HTTP_RETRY_TOTAL,
+        read=HTTP_RETRY_TOTAL,
+        backoff_factor=HTTP_BACKOFF_FACTOR,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+HTTP = build_http_session()
 
 
 # ============================================================
@@ -338,13 +379,14 @@ def send_telegram_message(text: str) -> Tuple[Dict[str, Any], int]:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     try:
-        response = requests.post(
+        response = HTTP.post(
             url,
             json={"chat_id": CHAT_ID, "text": text},
             timeout=15,
         )
         data = response.json()
     except Exception as e:
+        logger.exception("Telegram request failed")
         return {
             "status": "error",
             "message": "Telegram request failed",
@@ -374,7 +416,7 @@ def call_api_football(endpoint: str, params: Optional[Dict[str, Any]] = None) ->
     url = f"{API_FOOTBALL_BASE_URL}/{endpoint}"
 
     try:
-        response = requests.get(
+        response = HTTP.get(
             url,
             headers=headers,
             params=params or {},
@@ -576,7 +618,7 @@ def call_footystats(endpoint: str, params: Optional[Dict[str, Any]] = None, cach
     url = f"{FOOTYSTATS_BASE_URL}/{endpoint}"
 
     try:
-        response = requests.get(url, params=query, timeout=REQUEST_TIMEOUT)
+        response = HTTP.get(url, params=query, timeout=REQUEST_TIMEOUT)
         data = response.json()
     except Exception as e:
         return {
@@ -799,7 +841,7 @@ def call_odds_api(sport_key: str, cache_key: Optional[str] = None) -> Tuple[Dict
     url = f"{ODDS_API_BASE_URL}/sports/{sport_key}/odds/"
 
     try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response = HTTP.get(url, params=params, timeout=REQUEST_TIMEOUT)
         data = response.json()
     except Exception as e:
         return {
@@ -2051,11 +2093,11 @@ def resolve_pending_signals(limit: int = RESOLVE_BATCH_LIMIT) -> Dict[str, Any]:
 # ============================================================
 # SCHEDULER — scan toutes les heures de 07h00 à 23h00 UTC
 # ============================================================
-def run_full_scan_job():
-    """Lance automatiquement le scan 1X2 + Buts/BTTS si dans la plage horaire."""
+def _run_full_scan_job_core(trigger: str = "scheduler") -> int:
     hour = now_utc().hour
-    if not (SCAN_START_HOUR <= hour <= SCAN_END_HOUR):
-        return  # Hors plage, on dort
+    if trigger == "scheduler" and not (SCAN_START_HOUR <= hour <= SCAN_END_HOUR):
+        logger.info("Scan skipped: outside scan window | hour=%s", hour)
+        return 0
 
     date_str = utc_today_str()
     timestamp = now_utc().strftime("%H:%M UTC")
@@ -2063,7 +2105,7 @@ def run_full_scan_job():
     fixtures_data, fixtures_status = get_fixtures_by_date(date_str)
     if fixtures_status != 200:
         send_telegram_message(f"⚠️ Scan {timestamp} — Impossible de récupérer les matchs.")
-        return
+        raise RuntimeError(f"get_fixtures_by_date failed: status={fixtures_status}")
 
     fixtures = fixtures_data["data"].get("response", [])
     footy_matches = None
@@ -2071,6 +2113,8 @@ def run_full_scan_job():
         footy_payload, footy_status = get_footystats_matches_by_date(date_str)
         if footy_status == 200:
             footy_matches = footystats_data_as_list(footy_payload["data"])
+        else:
+            logger.warning("FootyStats matches fetch failed | status=%s", footy_status)
 
     signals_sent = 0
 
@@ -2085,7 +2129,6 @@ def run_full_scan_job():
         detail = build_fixture_detail(match)
         fixture_id = str(detail["fixture_id"])
 
-        # --- 1X2 ---
         try:
             a1x2, s1x2 = analyse_fixture_value_core(fixture_id, preloaded_footy_matches=footy_matches)
             if s1x2 == 200 and a1x2.get("decision") != "NO_BET" and (a1x2.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
@@ -2093,17 +2136,13 @@ def run_full_scan_job():
                     summarize_1x2_signal(a1x2["fixture"], a1x2, a1x2["odds_1x2"])
                 )
                 log_1x2_signal(
-                    detail=a1x2["fixture"],
-                    analysis=a1x2,
-                    odds_1x2=a1x2["odds_1x2"],
-                    telegram_data=tg_data,
-                    telegram_http_status=tg_status,
+                    detail=a1x2["fixture"], analysis=a1x2, odds_1x2=a1x2["odds_1x2"],
+                    telegram_data=tg_data, telegram_http_status=tg_status,
                 )
                 signals_sent += 1
         except Exception:
-            logger.exception("run_full_scan_job 1X2 failed for fixture_id=%s", fixture_id)
+            logger.exception("1X2 scan failed | fixture_id=%s", fixture_id)
 
-        # --- GOALS / BTTS ---
         try:
             agoals, sgoals = analyse_fixture_goals_core(fixture_id, preloaded_footy_matches=footy_matches)
             if sgoals == 200 and agoals.get("decision") != "NO_BET" and (agoals.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
@@ -2111,23 +2150,61 @@ def run_full_scan_job():
                     summarize_goals_signal(agoals["fixture"], agoals)
                 )
                 log_goals_signal(
-                    detail=agoals["fixture"],
-                    analysis=agoals,
-                    telegram_data=tg_data,
-                    telegram_http_status=tg_status,
+                    detail=agoals["fixture"], analysis=agoals,
+                    telegram_data=tg_data, telegram_http_status=tg_status,
                 )
                 signals_sent += 1
         except Exception:
-            logger.exception("run_full_scan_job GOALS failed for fixture_id=%s", fixture_id)
+            logger.exception("GOALS scan failed | fixture_id=%s", fixture_id)
 
         if signals_sent >= MAX_SCAN_RESULTS:
             break
 
     if signals_sent == 0:
         send_telegram_message(
-            f"🔍 Scan automatique {date_str} {timestamp}\n"
+            f"🔍 Scan {trigger} {date_str} {timestamp}\n"
             f"Aucun signal VALUE/MAIN détecté sur les ligues surveillées."
         )
+
+    return signals_sent
+
+
+def run_full_scan_job(trigger: str = "scheduler") -> Dict[str, Any]:
+    if not SCAN_LOCK.acquire(blocking=False):
+        logger.warning("Scan refused: another scan is already running | trigger=%s", trigger)
+        return {"status": "busy", "message": "scan already running"}
+
+    started = time.time()
+    SCAN_STATE["running"] = True
+    SCAN_STATE["started_at"] = now_utc().isoformat()
+    SCAN_STATE["last_error"] = None
+
+    try:
+        signals_sent = _run_full_scan_job_core(trigger=trigger)
+        SCAN_STATE["last_success"] = now_utc().isoformat()
+        SCAN_STATE["last_signals_sent"] = signals_sent
+        SCAN_STATE["last_duration_seconds"] = round(time.time() - started, 2)
+        logger.info(
+            "Scan completed | trigger=%s | signals_sent=%s | duration=%ss",
+            trigger, signals_sent, SCAN_STATE["last_duration_seconds"],
+        )
+        return {
+            "status": "ok",
+            "signals_sent": signals_sent,
+            "duration_seconds": SCAN_STATE["last_duration_seconds"],
+        }
+    except Exception as exc:
+        SCAN_STATE["last_error"] = str(exc)
+        SCAN_STATE["last_duration_seconds"] = round(time.time() - started, 2)
+        logger.exception("Scan crashed | trigger=%s", trigger)
+        return {
+            "status": "error",
+            "message": str(exc),
+            "duration_seconds": SCAN_STATE["last_duration_seconds"],
+        }
+    finally:
+        SCAN_STATE["running"] = False
+        SCAN_LOCK.release()
 
 
 def resolve_pending_signals_job():
@@ -2145,15 +2222,25 @@ def resolve_pending_signals_job():
 
 
 def _scheduler_loop():
-    schedule.every().hour.at(":00").do(run_full_scan_job)
+    schedule.every().hour.at(":00").do(lambda: run_full_scan_job(trigger="scheduler"))
     schedule.every(30).minutes.do(resolve_pending_signals_job)
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception:
+            logger.exception("Scheduler loop failed")
         time.sleep(30)
 
 
-# Lancement du scheduler en thread daemon
-threading.Thread(target=_scheduler_loop, daemon=True, name="ApexScheduler").start()
+def start_scheduler_if_enabled():
+    if not ENABLE_SCHEDULER:
+        logger.info("Scheduler disabled (ENABLE_SCHEDULER=0)")
+        return
+    logger.info("Scheduler enabled — scan every hour %sh00–%sh00 UTC", SCAN_START_HOUR, SCAN_END_HOUR)
+    threading.Thread(target=_scheduler_loop, daemon=True, name="ApexScheduler").start()
+
+
+start_scheduler_if_enabled()
 
 # Init DB au démarrage (gunicorn + dev)
 init_db()
@@ -2170,7 +2257,7 @@ def set_telegram_webhook(url: str) -> Tuple[Dict[str, Any], int]:
     if WEBHOOK_SECRET:
         params["secret_token"] = WEBHOOK_SECRET
     try:
-        r = requests.post(
+        r = HTTP.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
             json=params,
             timeout=15,
@@ -2183,11 +2270,28 @@ def set_telegram_webhook(url: str) -> Tuple[Dict[str, Any], int]:
 def _handle_telegram_command(cmd: str) -> None:
     """Traite une commande Telegram reçue via webhook."""
     if cmd == "/scan":
+        now_ts = time.time()
+        last_manual = SCAN_STATE.get("last_manual_trigger_at")
+
+        if SCAN_STATE.get("running"):
+            send_telegram_message("⏳ Un scan est déjà en cours. Attends sa fin.")
+            return
+
+        if last_manual and (now_ts - last_manual) < SCAN_COOLDOWN_SECONDS:
+            wait_left = int(SCAN_COOLDOWN_SECONDS - (now_ts - last_manual))
+            send_telegram_message(f"⏳ Cooldown actif. Réessaie dans {wait_left}s.")
+            return
+
+        SCAN_STATE["last_manual_trigger_at"] = now_ts
         send_telegram_message(
             "🔍 Scan lancé manuellement...\n"
-            "Analyse 1X2 + Buts + BTTS en cours. Résultats dans quelques instants."
+            "Analyse 1X2 + Buts + BTTS en cours."
         )
-        threading.Thread(target=run_full_scan_job, daemon=True).start()
+        threading.Thread(
+            target=lambda: run_full_scan_job(trigger="manual"),
+            daemon=True,
+            name="ManualScan",
+        ).start()
 
     elif cmd == "/status":
         send_telegram_message(
@@ -2282,6 +2386,29 @@ def home():
             "odds_api_bookmakers": ODDS_API_BOOKMAKERS,
         },
     })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "build_id": BUILD_ID,
+        "scheduler_enabled": ENABLE_SCHEDULER,
+        "scan_running": SCAN_STATE.get("running"),
+        "scan_started_at": SCAN_STATE.get("started_at"),
+        "last_success": SCAN_STATE.get("last_success"),
+        "last_error": SCAN_STATE.get("last_error"),
+        "last_duration_seconds": SCAN_STATE.get("last_duration_seconds"),
+        "last_signals_sent": SCAN_STATE.get("last_signals_sent"),
+        "config": {
+            "api_football": bool(API_KEY),
+            "footystats": bool(FOOTYSTATS_KEY),
+            "odds_api": bool(ODDS_API_KEY),
+            "telegram_bot": bool(BOT_TOKEN),
+            "telegram_chat": bool(CHAT_ID),
+            "webhook_secret": bool(WEBHOOK_SECRET),
+        },
+    }), 200
 
 
 @app.route("/version")
