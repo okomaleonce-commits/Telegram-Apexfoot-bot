@@ -505,15 +505,24 @@ def find_team_standing(standings_response: List[Dict[str, Any]], team_id: Option
     return None
 
 
-def get_api_context(detail: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
-    standings_data, standings_status = call_api_football(
-        "standings",
-        {"league": detail["league_id"], "season": detail["season"]},
-    )
-    if standings_status != 200:
-        return standings_data, standings_status
+def get_api_context(detail: Dict[str, Any], standings_cache: Optional[Dict[Tuple, Any]] = None) -> Tuple[Dict[str, Any], int]:
+    league_id = detail["league_id"]
+    season = detail["season"]
+    cache_key = (league_id, season)
 
-    standings_response = standings_data["data"].get("response", [])
+    # Vérification du cache intra-scan
+    if standings_cache is not None and cache_key in standings_cache:
+        standings_response = standings_cache[cache_key]
+    else:
+        standings_data, standings_status = call_api_football(
+            "standings",
+            {"league": league_id, "season": season},
+        )
+        if standings_status != 200:
+            return standings_data, standings_status
+        standings_response = standings_data["data"].get("response", [])
+        if standings_cache is not None:
+            standings_cache[cache_key] = standings_response
     home_standing = find_team_standing(standings_response, detail["home_team_id"])
     away_standing = find_team_standing(standings_response, detail["away_team_id"])
 
@@ -1490,7 +1499,7 @@ def decide_goals_signal(detail: Dict[str, Any], api_context: Dict[str, Any], fs:
 # ============================================================
 # CORE ANALYSIS
 # ============================================================
-def analyse_fixture_value_core(fixture_id: str, preloaded_footy_matches: Optional[List[Dict[str, Any]]] = None) -> Tuple[Dict[str, Any], int]:
+def analyse_fixture_value_core(fixture_id: str, preloaded_footy_matches: Optional[List[Dict[str, Any]]] = None, standings_cache: Optional[Dict[Tuple, Any]] = None) -> Tuple[Dict[str, Any], int]:
     fixture_data, fixture_status = get_fixture_by_id(fixture_id)
     if fixture_status != 200:
         return fixture_data, fixture_status
@@ -1506,7 +1515,7 @@ def analyse_fixture_value_core(fixture_id: str, preloaded_footy_matches: Optiona
             "message": "Fixture is not pre-match anymore",
         }, 200
 
-    api_context_payload, api_context_status = get_api_context(detail)
+    api_context_payload, api_context_status = get_api_context(detail, standings_cache=standings_cache)
     if api_context_status != 200:
         return api_context_payload, api_context_status
 
@@ -1610,7 +1619,7 @@ def analyse_fixture_value_core(fixture_id: str, preloaded_footy_matches: Optiona
     }, 200
 
 
-def analyse_fixture_goals_core(fixture_id: str, preloaded_footy_matches: Optional[List[Dict[str, Any]]] = None) -> Tuple[Dict[str, Any], int]:
+def analyse_fixture_goals_core(fixture_id: str, preloaded_footy_matches: Optional[List[Dict[str, Any]]] = None, standings_cache: Optional[Dict[Tuple, Any]] = None) -> Tuple[Dict[str, Any], int]:
     fixture_data, fixture_status = get_fixture_by_id(fixture_id)
     if fixture_status != 200:
         return fixture_data, fixture_status
@@ -1626,7 +1635,7 @@ def analyse_fixture_goals_core(fixture_id: str, preloaded_footy_matches: Optiona
             "message": "Fixture is not pre-match anymore",
         }, 200
 
-    api_context_payload, api_context_status = get_api_context(detail)
+    api_context_payload, api_context_status = get_api_context(detail, standings_cache=standings_cache)
     if api_context_status != 200:
         return api_context_payload, api_context_status
 
@@ -1924,6 +1933,21 @@ def log_goals_signal(
 ) -> Dict[str, Any]:
     market = analysis.get("market") or infer_market_from_decision(analysis.get("decision"))
     odd = pick_goals_logged_odd(analysis)
+
+    # Ne pas enregistrer un pari goals sans cote exploitable
+    if odd is None:
+        logger.warning(
+            "SKIP goals signal logging: missing odd | fixture_id=%s | market=%s | decision=%s",
+            detail.get("fixture_id"), market, analysis.get("decision"),
+        )
+        return {
+            "status": "skipped",
+            "reason": "missing_odd",
+            "fixture_id": maybe_int(detail.get("fixture_id")),
+            "market": market,
+            "decision": analysis.get("decision"),
+        }
+
     record = {
         "signal_uid": build_signal_uid(
             detail.get("fixture_id"), market, None,
@@ -2117,6 +2141,7 @@ def _run_full_scan_job_core(trigger: str = "scheduler") -> int:
             logger.warning("FootyStats matches fetch failed | status=%s", footy_status)
 
     signals_sent = 0
+    standings_cache: Dict[Tuple, Any] = {}  # Cache intra-scan: évite N appels standings pour la même ligue
 
     for match in fixtures:
         if not is_target_league_by_id(match):
@@ -2130,7 +2155,7 @@ def _run_full_scan_job_core(trigger: str = "scheduler") -> int:
         fixture_id = str(detail["fixture_id"])
 
         try:
-            a1x2, s1x2 = analyse_fixture_value_core(fixture_id, preloaded_footy_matches=footy_matches)
+            a1x2, s1x2 = analyse_fixture_value_core(fixture_id, preloaded_footy_matches=footy_matches, standings_cache=standings_cache)
             if s1x2 == 200 and a1x2.get("decision") != "NO_BET" and (a1x2.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
                 tg_data, tg_status = send_telegram_message(
                     summarize_1x2_signal(a1x2["fixture"], a1x2, a1x2["odds_1x2"])
@@ -2144,7 +2169,7 @@ def _run_full_scan_job_core(trigger: str = "scheduler") -> int:
             logger.exception("1X2 scan failed | fixture_id=%s", fixture_id)
 
         try:
-            agoals, sgoals = analyse_fixture_goals_core(fixture_id, preloaded_footy_matches=footy_matches)
+            agoals, sgoals = analyse_fixture_goals_core(fixture_id, preloaded_footy_matches=footy_matches, standings_cache=standings_cache)
             if sgoals == 200 and agoals.get("decision") != "NO_BET" and (agoals.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
                 tg_data, tg_status = send_telegram_message(
                     summarize_goals_signal(agoals["fixture"], agoals)
@@ -2829,6 +2854,23 @@ def debug_fixture_value():
 # ============================================================
 # ROUTES SQLITE / BACKTEST
 # ============================================================
+@app.route("/admin/clean-null-odds")
+def clean_null_odds():
+    """Supprime les paris goals pending sans cote — à appeler une seule fois."""
+    with closing(db_connect()) as conn:
+        cur = conn.execute("""
+            DELETE FROM signals
+            WHERE market IN ('BTTS_YES','BTTS_NO','OVER_2_5','UNDER_2_5')
+              AND odd IS NULL
+              AND result_status = 'pending'
+        """)
+        deleted = cur.rowcount
+        conn.commit()
+        remaining = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    logger.info("clean-null-odds: deleted=%s remaining=%s", deleted, remaining)
+    return ok({"status": "ok", "deleted": deleted, "remaining": remaining})
+
+
 @app.route("/resolve-pending-signals")
 def resolve_pending_signals_route():
     limit = maybe_int(request.args.get("limit")) or RESOLVE_BATCH_LIMIT
