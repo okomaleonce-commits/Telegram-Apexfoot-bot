@@ -1,10 +1,14 @@
 
 import os
 import re
+import json
 import time
 import math
+import logging
+import sqlite3
 import threading
 import unicodedata
+from contextlib import closing
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +19,9 @@ from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
+
+# Init SQLite DB at startup
+# (called after all functions are defined — see bottom of CONFIG block)
 
 # ============================================================
 # CONFIG
@@ -28,6 +35,17 @@ FOOTYSTATS_KEY = os.environ.get("FOOTYSTATS_KEY")
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 ODDS_API_BOOKMAKERS = os.environ.get("ODDS_API_BOOKMAKERS", "bet365,unibet")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+DB_PATH = os.environ.get("DB_PATH", "/tmp/apex_signals.db")
+AUTO_RESOLVE_ENABLED = os.environ.get("AUTO_RESOLVE_ENABLED", "1") == "1"
+DEFAULT_STAKE = float(os.environ.get("DEFAULT_STAKE", "1.0"))
+RESOLVE_BATCH_LIMIT = int(os.environ.get("RESOLVE_BATCH_LIMIT", "200"))
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("apexbot")
 
 API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 FOOTYSTATS_BASE_URL = "https://api.football-data-api.com"
@@ -1639,6 +1657,398 @@ def summarize_goals_signal(detail: Dict[str, Any], analysis: Dict[str, Any]) -> 
 
 
 # ============================================================
+# SQLITE / JOURNALISATION / BACKTEST
+# ============================================================
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with closing(db_connect()) as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_uid TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            fixture_id INTEGER NOT NULL,
+            match_date TEXT,
+            kickoff_utc TEXT,
+            league_id INTEGER,
+            league_name TEXT,
+            country TEXT,
+            home_team TEXT,
+            away_team TEXT,
+            market TEXT,
+            side TEXT,
+            decision TEXT NOT NULL,
+            level INTEGER NOT NULL,
+            level_name TEXT,
+            odd REAL,
+            raw_edge REAL,
+            adjusted_edge REAL,
+            confluence_count INTEGER,
+            confidence_count INTEGER,
+            rationale TEXT,
+            contextual_flags TEXT,
+            contextual_penalties TEXT,
+            telegram_sent INTEGER DEFAULT 0,
+            telegram_http_status INTEGER,
+            telegram_message_id TEXT,
+            result_status TEXT DEFAULT 'pending',
+            match_status TEXT,
+            home_goals INTEGER,
+            away_goals INTEGER,
+            bet_outcome TEXT,
+            stake REAL DEFAULT 1.0,
+            profit REAL DEFAULT 0.0,
+            resolved_at TEXT
+        )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_fixture_id ON signals(fixture_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_result_status ON signals(result_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_level ON signals(level)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_build_id ON signals(build_id)")
+        conn.commit()
+
+
+def json_dumps_safe(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return json.dumps(str(value), ensure_ascii=False)
+
+
+def extract_telegram_message_id(telegram_data: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(telegram_data, dict):
+        return None
+    try:
+        return str(
+            telegram_data.get("telegram_response", {})
+            .get("result", {})
+            .get("message_id")
+        )
+    except Exception:
+        return None
+
+
+def build_signal_uid(
+    fixture_id: Any,
+    market: Optional[str],
+    side: Optional[str],
+    decision: Optional[str],
+    level: Optional[int],
+    kickoff_utc: Optional[str],
+) -> str:
+    match_day = str(kickoff_utc or "")[:10]
+    return "|".join([
+        str(BUILD_ID),
+        str(fixture_id),
+        str(match_day),
+        str(market or ""),
+        str(side or ""),
+        str(decision or ""),
+        str(level or 0),
+    ])
+
+
+def infer_market_from_decision(decision: Optional[str]) -> Optional[str]:
+    if not decision:
+        return None
+    d = str(decision).upper()
+    if d.endswith("_HOME") or d.endswith("_DRAW") or d.endswith("_AWAY"):
+        return "1X2"
+    for market in ["BTTS_YES", "BTTS_NO", "OVER_2_5", "UNDER_2_5"]:
+        if market in d:
+            return market
+    return None
+
+
+def pick_goals_logged_odd(analysis: Dict[str, Any], footystats: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    market = analysis.get("market")
+    if not market:
+        return None
+    fs = footystats or analysis.get("footystats_features_used") or {}
+    if not isinstance(fs, dict):
+        return None
+    if market == "BTTS_YES":
+        return maybe_float(fs.get("odds_btts_yes"))
+    if market == "BTTS_NO":
+        return maybe_float(fs.get("odds_btts_no"))
+    if market == "OVER_2_5":
+        return maybe_float(fs.get("odds_ft_over25"))
+    if market == "UNDER_2_5":
+        return maybe_float(fs.get("odds_ft_under25"))
+    return None
+
+
+def save_signal_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    required = ["signal_uid", "created_at", "build_id", "fixture_id", "decision", "level"]
+    for key in required:
+        if record.get(key) is None:
+            raise ValueError(f"Missing required record field: {key}")
+    with closing(db_connect()) as conn:
+        conn.execute("""
+        INSERT OR IGNORE INTO signals (
+            signal_uid, created_at, build_id, fixture_id, match_date, kickoff_utc,
+            league_id, league_name, country, home_team, away_team,
+            market, side, decision, level, level_name,
+            odd, raw_edge, adjusted_edge, confluence_count, confidence_count,
+            rationale, contextual_flags, contextual_penalties,
+            telegram_sent, telegram_http_status, telegram_message_id, stake
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            record.get("signal_uid"), record.get("created_at"), record.get("build_id"),
+            record.get("fixture_id"), record.get("match_date"), record.get("kickoff_utc"),
+            record.get("league_id"), record.get("league_name"), record.get("country"),
+            record.get("home_team"), record.get("away_team"),
+            record.get("market"), record.get("side"), record.get("decision"),
+            record.get("level"), record.get("level_name"),
+            record.get("odd"), record.get("raw_edge"), record.get("adjusted_edge"),
+            record.get("confluence_count"), record.get("confidence_count"),
+            record.get("rationale"), record.get("contextual_flags"), record.get("contextual_penalties"),
+            1 if record.get("telegram_sent") else 0,
+            record.get("telegram_http_status"), record.get("telegram_message_id"),
+            record.get("stake", DEFAULT_STAKE),
+        ))
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, signal_uid FROM signals WHERE signal_uid = ?",
+            (record["signal_uid"],)
+        ).fetchone()
+    return {
+        "status": "ok",
+        "signal_uid": record["signal_uid"],
+        "row_id": int(row["id"]) if row else None,
+    }
+
+
+def log_1x2_signal(
+    detail: Dict[str, Any],
+    analysis: Dict[str, Any],
+    odds_1x2: Dict[str, Any],
+    telegram_data: Optional[Dict[str, Any]] = None,
+    telegram_http_status: Optional[int] = None,
+) -> Dict[str, Any]:
+    market = "1X2"
+    side = analysis.get("side")
+    odd = maybe_float(odds_1x2.get(side)) if side else None
+    record = {
+        "signal_uid": build_signal_uid(
+            detail.get("fixture_id"), market, side,
+            analysis.get("decision"), analysis.get("level"),
+            detail.get("kickoff_utc") or detail.get("date"),
+        ),
+        "created_at": now_utc().isoformat(),
+        "build_id": BUILD_ID,
+        "fixture_id": maybe_int(detail.get("fixture_id")),
+        "match_date": str(detail.get("date") or "")[:10],
+        "kickoff_utc": detail.get("kickoff_utc") or detail.get("date"),
+        "league_id": maybe_int(detail.get("league_id")),
+        "league_name": detail.get("league_name"),
+        "country": detail.get("country"),
+        "home_team": detail.get("home"),
+        "away_team": detail.get("away"),
+        "market": market,
+        "side": side,
+        "decision": analysis.get("decision"),
+        "level": maybe_int(analysis.get("level")) or 0,
+        "level_name": analysis.get("level_name"),
+        "odd": odd,
+        "raw_edge": maybe_float(analysis.get("raw_best_edge_value")),
+        "adjusted_edge": maybe_float(analysis.get("best_edge_value")),
+        "confluence_count": maybe_int(analysis.get("confluence_count")),
+        "confidence_count": None,
+        "rationale": json_dumps_safe(analysis.get("rationale", [])),
+        "contextual_flags": json_dumps_safe(analysis.get("contextual_flags", {})),
+        "contextual_penalties": json_dumps_safe(analysis.get("contextual_penalties", [])),
+        "telegram_sent": telegram_http_status == 200,
+        "telegram_http_status": telegram_http_status,
+        "telegram_message_id": extract_telegram_message_id(telegram_data),
+        "stake": DEFAULT_STAKE,
+    }
+    return save_signal_record(record)
+
+
+def log_goals_signal(
+    detail: Dict[str, Any],
+    analysis: Dict[str, Any],
+    telegram_data: Optional[Dict[str, Any]] = None,
+    telegram_http_status: Optional[int] = None,
+) -> Dict[str, Any]:
+    market = analysis.get("market") or infer_market_from_decision(analysis.get("decision"))
+    odd = pick_goals_logged_odd(analysis)
+    record = {
+        "signal_uid": build_signal_uid(
+            detail.get("fixture_id"), market, None,
+            analysis.get("decision"), analysis.get("level"),
+            detail.get("kickoff_utc") or detail.get("date"),
+        ),
+        "created_at": now_utc().isoformat(),
+        "build_id": BUILD_ID,
+        "fixture_id": maybe_int(detail.get("fixture_id")),
+        "match_date": str(detail.get("date") or "")[:10],
+        "kickoff_utc": detail.get("kickoff_utc") or detail.get("date"),
+        "league_id": maybe_int(detail.get("league_id")),
+        "league_name": detail.get("league_name"),
+        "country": detail.get("country"),
+        "home_team": detail.get("home"),
+        "away_team": detail.get("away"),
+        "market": market,
+        "side": None,
+        "decision": analysis.get("decision"),
+        "level": maybe_int(analysis.get("level")) or 0,
+        "level_name": analysis.get("level_name"),
+        "odd": odd,
+        "raw_edge": None,
+        "adjusted_edge": None,
+        "confluence_count": None,
+        "confidence_count": maybe_int(analysis.get("confidence_count")),
+        "rationale": json_dumps_safe(analysis.get("rationale", [])),
+        "contextual_flags": json_dumps_safe({}),
+        "contextual_penalties": json_dumps_safe([]),
+        "telegram_sent": telegram_http_status == 200,
+        "telegram_http_status": telegram_http_status,
+        "telegram_message_id": extract_telegram_message_id(telegram_data),
+        "stake": DEFAULT_STAKE,
+    }
+    return save_signal_record(record)
+
+
+# ============================================================
+# RESOLUTION / RESULTATS / PROFIT
+# ============================================================
+FINAL_STATUSES = {"FT", "AET", "PEN"}
+VOID_STATUSES = {"CANC", "PST", "ABD", "AWD", "WO"}
+
+
+def compute_bet_outcome(
+    market: Optional[str],
+    side: Optional[str],
+    home_goals: Optional[int],
+    away_goals: Optional[int],
+    match_status: Optional[str],
+) -> str:
+    if match_status in VOID_STATUSES:
+        return "void"
+    if home_goals is None or away_goals is None:
+        return "pending"
+    total_goals = home_goals + away_goals
+    if market == "1X2":
+        if side == "Home":
+            return "win" if home_goals > away_goals else "loss"
+        if side == "Draw":
+            return "win" if home_goals == away_goals else "loss"
+        if side == "Away":
+            return "win" if away_goals > home_goals else "loss"
+        return "loss"
+    if market == "BTTS_YES":
+        return "win" if home_goals > 0 and away_goals > 0 else "loss"
+    if market == "BTTS_NO":
+        return "win" if home_goals == 0 or away_goals == 0 else "loss"
+    if market == "OVER_2_5":
+        return "win" if total_goals >= 3 else "loss"
+    if market == "UNDER_2_5":
+        return "win" if total_goals <= 2 else "loss"
+    return "loss"
+
+
+def compute_profit(outcome: str, odd: Optional[float], stake: float) -> float:
+    if outcome == "win":
+        if odd is None or odd <= 1:
+            return 0.0
+        return round((odd - 1.0) * stake, 4)
+    if outcome == "loss":
+        return round(-stake, 4)
+    return 0.0
+
+
+def resolve_fixture_signals(fixture_id: int) -> Dict[str, Any]:
+    fixture_data, fixture_status = get_fixture_by_id(str(fixture_id))
+    if fixture_status != 200:
+        return {"status": "error", "fixture_id": fixture_id, "details": fixture_data}
+
+    match = fixture_data["fixture"]
+    status_short = match.get("fixture", {}).get("status", {}).get("short")
+    home_goals = maybe_int(match.get("goals", {}).get("home"))
+    away_goals = maybe_int(match.get("goals", {}).get("away"))
+
+    if status_short not in FINAL_STATUSES and status_short not in VOID_STATUSES:
+        return {"status": "pending", "fixture_id": fixture_id, "match_status": status_short}
+
+    with closing(db_connect()) as conn:
+        rows = conn.execute("""
+            SELECT * FROM signals
+            WHERE fixture_id = ? AND result_status = 'pending'
+        """, (fixture_id,)).fetchall()
+
+        resolved_count = 0
+        for row in rows:
+            outcome = compute_bet_outcome(
+                market=row["market"], side=row["side"],
+                home_goals=home_goals, away_goals=away_goals,
+                match_status=status_short,
+            )
+            profit = compute_profit(
+                outcome=outcome,
+                odd=maybe_float(row["odd"]),
+                stake=maybe_float(row["stake"]) or DEFAULT_STAKE,
+            )
+            conn.execute("""
+                UPDATE signals
+                SET result_status = 'resolved', match_status = ?,
+                    home_goals = ?, away_goals = ?,
+                    bet_outcome = ?, profit = ?, resolved_at = ?
+                WHERE id = ?
+            """, (status_short, home_goals, away_goals, outcome, profit, now_utc().isoformat(), row["id"]))
+            resolved_count += 1
+        conn.commit()
+
+    return {
+        "status": "ok",
+        "fixture_id": fixture_id,
+        "match_status": status_short,
+        "home_goals": home_goals,
+        "away_goals": away_goals,
+        "resolved_count": resolved_count,
+    }
+
+
+def resolve_pending_signals(limit: int = RESOLVE_BATCH_LIMIT) -> Dict[str, Any]:
+    with closing(db_connect()) as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT fixture_id FROM signals
+            WHERE result_status = 'pending'
+            ORDER BY created_at ASC LIMIT ?
+        """, (limit,)).fetchall()
+
+    fixture_ids = [int(r["fixture_id"]) for r in rows]
+    results = []
+    total_resolved = 0
+
+    for fixture_id in fixture_ids:
+        try:
+            result = resolve_fixture_signals(fixture_id)
+            results.append(result)
+            if result.get("status") == "ok":
+                total_resolved += int(result.get("resolved_count", 0))
+        except Exception as exc:
+            logger.exception("resolve_fixture_signals failed for fixture_id=%s", fixture_id)
+            results.append({"status": "error", "fixture_id": fixture_id, "details": str(exc)})
+
+    return {
+        "status": "ok",
+        "checked_fixtures": len(fixture_ids),
+        "resolved_signals": total_resolved,
+        "results": results,
+    }
+
+
+# ============================================================
 # SCHEDULER — scan toutes les heures de 07h00 à 23h00 UTC
 # ============================================================
 def run_full_scan_job():
@@ -1679,19 +2089,36 @@ def run_full_scan_job():
         try:
             a1x2, s1x2 = analyse_fixture_value_core(fixture_id, preloaded_footy_matches=footy_matches)
             if s1x2 == 200 and a1x2.get("decision") != "NO_BET" and (a1x2.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
-                send_telegram_message(summarize_1x2_signal(a1x2["fixture"], a1x2, a1x2["odds_1x2"]))
+                tg_data, tg_status = send_telegram_message(
+                    summarize_1x2_signal(a1x2["fixture"], a1x2, a1x2["odds_1x2"])
+                )
+                log_1x2_signal(
+                    detail=a1x2["fixture"],
+                    analysis=a1x2,
+                    odds_1x2=a1x2["odds_1x2"],
+                    telegram_data=tg_data,
+                    telegram_http_status=tg_status,
+                )
                 signals_sent += 1
         except Exception:
-            pass
+            logger.exception("run_full_scan_job 1X2 failed for fixture_id=%s", fixture_id)
 
         # --- GOALS / BTTS ---
         try:
             agoals, sgoals = analyse_fixture_goals_core(fixture_id, preloaded_footy_matches=footy_matches)
             if sgoals == 200 and agoals.get("decision") != "NO_BET" and (agoals.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
-                send_telegram_message(summarize_goals_signal(agoals["fixture"], agoals))
+                tg_data, tg_status = send_telegram_message(
+                    summarize_goals_signal(agoals["fixture"], agoals)
+                )
+                log_goals_signal(
+                    detail=agoals["fixture"],
+                    analysis=agoals,
+                    telegram_data=tg_data,
+                    telegram_http_status=tg_status,
+                )
                 signals_sent += 1
         except Exception:
-            pass
+            logger.exception("run_full_scan_job GOALS failed for fixture_id=%s", fixture_id)
 
         if signals_sent >= MAX_SCAN_RESULTS:
             break
@@ -1703,8 +2130,23 @@ def run_full_scan_job():
         )
 
 
+def resolve_pending_signals_job():
+    if not AUTO_RESOLVE_ENABLED:
+        return
+    try:
+        result = resolve_pending_signals(limit=RESOLVE_BATCH_LIMIT)
+        logger.info(
+            "resolve_pending_signals_job done | checked=%s | resolved=%s",
+            result.get("checked_fixtures"),
+            result.get("resolved_signals"),
+        )
+    except Exception:
+        logger.exception("resolve_pending_signals_job failed")
+
+
 def _scheduler_loop():
     schedule.every().hour.at(":00").do(run_full_scan_job)
+    schedule.every(30).minutes.do(resolve_pending_signals_job)
     while True:
         schedule.run_pending()
         time.sleep(30)
@@ -1712,6 +2154,10 @@ def _scheduler_loop():
 
 # Lancement du scheduler en thread daemon
 threading.Thread(target=_scheduler_loop, daemon=True, name="ApexScheduler").start()
+
+# Init DB au démarrage (gunicorn + dev)
+init_db()
+logger.info("DB initialized at %s", DB_PATH)
 
 
 # ============================================================
@@ -2253,7 +2699,90 @@ def debug_fixture_value():
     })
 
 
+# ============================================================
+# ROUTES SQLITE / BACKTEST
+# ============================================================
+@app.route("/resolve-pending-signals")
+def resolve_pending_signals_route():
+    limit = maybe_int(request.args.get("limit")) or RESOLVE_BATCH_LIMIT
+    result = resolve_pending_signals(limit=limit)
+    return ok(result, 200)
+
+
+@app.route("/signals-summary")
+def signals_summary():
+    with closing(db_connect()) as conn:
+        overall = conn.execute("""
+            SELECT
+                COUNT(*) AS total_bets,
+                SUM(CASE WHEN bet_outcome = 'win' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN bet_outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN bet_outcome = 'void' THEN 1 ELSE 0 END) AS voids,
+                ROUND(COALESCE(SUM(profit), 0), 4) AS profit_total,
+                ROUND(COALESCE(SUM(stake), 0), 4) AS stake_total,
+                ROUND(
+                    CASE WHEN COALESCE(SUM(stake), 0) > 0
+                    THEN (SUM(profit) / SUM(stake)) * 100
+                    ELSE 0 END, 2
+                ) AS roi_percent
+            FROM signals WHERE result_status = 'resolved'
+        """).fetchone()
+
+        by_market = conn.execute("""
+            SELECT market,
+                COUNT(*) AS total_bets,
+                SUM(CASE WHEN bet_outcome = 'win' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN bet_outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
+                ROUND(COALESCE(SUM(profit), 0), 4) AS profit_total,
+                ROUND(
+                    CASE WHEN COALESCE(SUM(stake), 0) > 0
+                    THEN (SUM(profit) / SUM(stake)) * 100
+                    ELSE 0 END, 2
+                ) AS roi_percent
+            FROM signals WHERE result_status = 'resolved'
+            GROUP BY market ORDER BY profit_total DESC
+        """).fetchall()
+
+        by_level = conn.execute("""
+            SELECT level, level_name,
+                COUNT(*) AS total_bets,
+                SUM(CASE WHEN bet_outcome = 'win' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN bet_outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
+                ROUND(COALESCE(SUM(profit), 0), 4) AS profit_total,
+                ROUND(
+                    CASE WHEN COALESCE(SUM(stake), 0) > 0
+                    THEN (SUM(profit) / SUM(stake)) * 100
+                    ELSE 0 END, 2
+                ) AS roi_percent
+            FROM signals WHERE result_status = 'resolved'
+            GROUP BY level, level_name ORDER BY level DESC
+        """).fetchall()
+
+    return ok({
+        "status": "ok",
+        "build_id": BUILD_ID,
+        "overall": dict(overall) if overall else {},
+        "by_market": [dict(r) for r in by_market],
+        "by_level": [dict(r) for r in by_level],
+    }, 200)
+
+
+@app.route("/signals-recent")
+def signals_recent():
+    limit = maybe_int(request.args.get("limit")) or 20
+    with closing(db_connect()) as conn:
+        rows = conn.execute("""
+            SELECT * FROM signals ORDER BY created_at DESC LIMIT ?
+        """, (limit,)).fetchall()
+    return ok({
+        "status": "ok",
+        "count": len(rows),
+        "signals": [dict(r) for r in rows],
+    }, 200)
+
+
 if __name__ == "__main__":
+    init_db()
     print(f"🚀 BUILD_ID={BUILD_ID}")
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
