@@ -1228,96 +1228,112 @@ def analyse_over_under(fs_match: Optional[Dict], h2h: Dict,
     o25_pot = maybe_float((fs_match or {}).get("o25_potential"))
     u25_pot = maybe_float((fs_match or {}).get("u25_potential"))
     avg_pot = maybe_float((fs_match or {}).get("avg_potential"))
-    h2h_avg = h2h.get("avg_goals", 2.5)
+    h2h_avg = h2h.get("avg_goals", 2.5) if h2h.get("available") else None
 
     results = []
 
-    # ---- OVER 2.5 ----
-    o25_signals = 0
-    if total_xg >= 2.60: o25_signals += 1
-    if o25_pot is not None and o25_pot >= 58: o25_signals += 1
-    if h2h.get("available") and h2h_avg >= 2.8: o25_signals += 1
-    if avg_pot is not None and avg_pot >= 2.70: o25_signals += 1
-    if o25_signals >= 2:
-        prob = min(0.45 + o25_signals * 0.07, 0.78)
-        results.append({"market": "OVER_2_5", "prob": prob,
-                         "confidence": o25_signals * 12, "xg_total": round(total_xg, 2)})
+    # ---- OVER 2.5 ---- (bloqué si xG total < 2.3)
+    if total_xg >= 2.30:
+        o25_signals = 0
+        if total_xg >= 2.60: o25_signals += 1
+        if o25_pot is not None and o25_pot >= 58: o25_signals += 1
+        if h2h_avg is not None and h2h_avg >= 2.8: o25_signals += 1
+        if avg_pot is not None and avg_pot >= 2.70: o25_signals += 1
+        if o25_signals >= 2:
+            prob = min(0.45 + o25_signals * 0.07, 0.78)
+            results.append({"market": "OVER_2_5", "prob": prob,
+                             "confidence": o25_signals * 12, "xg_total": round(total_xg, 2)})
 
-    # ---- UNDER 2.5 ----
-    u25_signals = 0
-    if total_xg <= 2.20: u25_signals += 1
-    if u25_pot is not None and u25_pot >= 58: u25_signals += 1
-    if h2h.get("available") and h2h_avg <= 2.2: u25_signals += 1
-    if avg_pot is not None and avg_pot <= 2.30: u25_signals += 1
-    if u25_signals >= 2:
-        prob = min(0.45 + u25_signals * 0.07, 0.75)
-        results.append({"market": "UNDER_2_5", "prob": prob,
-                         "confidence": u25_signals * 11, "xg_total": round(total_xg, 2)})
+    # ---- UNDER 2.5 ---- (bloqué si xG total > 2.8)
+    if total_xg <= 2.80:
+        u25_signals = 0
+        if total_xg <= 2.20: u25_signals += 1
+        if u25_pot is not None and u25_pot >= 58: u25_signals += 1
+        if h2h_avg is not None and h2h_avg <= 2.2: u25_signals += 1
+        if avg_pot is not None and avg_pot <= 2.30: u25_signals += 1
+        if u25_signals >= 2:
+            prob = min(0.45 + u25_signals * 0.07, 0.75)
+            results.append({"market": "UNDER_2_5", "prob": prob,
+                             "confidence": u25_signals * 11, "xg_total": round(total_xg, 2)})
 
-    # ---- OVER 3.5 ----
-    o35_signals = 0
-    if total_xg >= 3.40: o35_signals += 1
-    if o25_pot is not None and o25_pot >= 70: o35_signals += 1
-    if h2h.get("available") and h2h_avg >= 3.5: o35_signals += 1
-    if o35_signals >= 2:
-        prob = min(0.35 + o35_signals * 0.08, 0.65)
-        results.append({"market": "OVER_3_5", "prob": prob,
-                         "confidence": o35_signals * 10, "xg_total": round(total_xg, 2)})
+    # ---- OVER 3.5 ---- (uniquement si xG total >= 3.0)
+    if total_xg >= 3.00:
+        o35_signals = 0
+        if total_xg >= 3.40: o35_signals += 1
+        if o25_pot is not None and o25_pot >= 70: o35_signals += 1
+        if h2h_avg is not None and h2h_avg >= 3.5: o35_signals += 1
+        if o35_signals >= 2:
+            prob = min(0.35 + o35_signals * 0.08, 0.65)
+            results.append({"market": "OVER_3_5", "prob": prob,
+                             "confidence": o35_signals * 10, "xg_total": round(total_xg, 2)})
 
-    # ---- OVER 4.5 ----
-    if total_xg >= 4.00 and h2h.get("avg_goals", 0) >= 4.0:
+    # ---- OVER 4.5 ---- (uniquement si xG total >= 4.0 ET H2H confirme)
+    if total_xg >= 4.00 and h2h_avg is not None and h2h_avg >= 4.0:
         results.append({"market": "OVER_4_5", "prob": 0.38,
                          "confidence": 15, "xg_total": round(total_xg, 2)})
 
     if not results:
         return None
-    # Retourne le marché avec la meilleure probabilité
     return max(results, key=lambda x: x["confidence"])
 
 def analyse_corners_market(stats_h: Optional[Dict],
-                            stats_a: Optional[Dict]) -> Optional[Dict]:
+                            stats_a: Optional[Dict],
+                            fs_match: Optional[Dict]) -> Optional[Dict]:
     """
-    Total Corners. Utilise stats API-Football (corners for/against).
-    Marché SIGNAL uniquement (cotes non récupérées automatiquement).
+    Total Corners. Utilise FootyStats si disponible.
+    Retourne None si pas de données suffisantes (évite les valeurs statiques inutiles).
     """
-    if not stats_h or not stats_a:
-        return None
-    h_corners = maybe_float(
-        stats_h.get("statistics", [{}])[0].get("value") if isinstance(
-            stats_h.get("statistics"), list) else None
-    )
-    # Fallback: cherche dans le dict directement
-    def avg_corners(stats: Dict, side: str) -> float:
-        played = (stats.get("fixtures", {}).get("played", {}).get("total") or 1)
-        # API-Football ne fournit pas toujours les corners dans /statistics
-        # On utilise une estimation basée sur la possession/style si dispo
-        return 5.0  # valeur neutre si non disponible
+    if not fs_match:
+        return None  # Pas de données FootyStats → pas de signal corners
 
-    h_avg = avg_corners(stats_h, "home")
-    a_avg = avg_corners(stats_a, "away")
-    total_est = h_avg + a_avg
+    # FootyStats fournit parfois avg_corners_home / avg_corners_away
+    h_corners = maybe_float(fs_match.get("home_avg_corners") or
+                             fs_match.get("team_a_corners_for_avg"))
+    a_corners  = maybe_float(fs_match.get("away_avg_corners") or
+                              fs_match.get("team_b_corners_for_avg"))
 
+    if not h_corners or not a_corners:
+        return None  # Pas assez de données
+
+    total_est = h_corners + a_corners
+    if total_est >= 11.0:
+        return {"market": "CORNERS_OVER_10_5", "prob": 0.58,
+                "confidence": 14, "estimated_total": round(total_est, 1)}
     if total_est >= 10.0:
-        return {"market": "CORNERS_OVER_9_5", "prob": 0.55,
+        return {"market": "CORNERS_OVER_9_5", "prob": 0.54,
                 "confidence": 12, "estimated_total": round(total_est, 1)}
     if total_est <= 8.0:
-        return {"market": "CORNERS_UNDER_9_5", "prob": 0.52,
-                "confidence": 10, "estimated_total": round(total_est, 1)}
+        return {"market": "CORNERS_UNDER_9_5", "prob": 0.54,
+                "confidence": 12, "estimated_total": round(total_est, 1)}
     return None
 
-def analyse_cards_market(stats_h: Optional[Dict],
-                          stats_a: Optional[Dict]) -> Optional[Dict]:
-    """
-    Total Cartons Jaunes. Marché SIGNAL.
-    Utilise stats API-Football si disponibles.
-    """
-    if not stats_h or not stats_a:
-        return None
-    # Estimation neutre — sera enrichi quand l'API retourne les données cards
-    total_est = 4.0  # valeur par défaut (~4 cartons/match en moyenne européenne)
 
-    return {"market": "CARDS_OVER_3_5", "prob": 0.52,
-            "confidence": 10, "estimated_total": total_est}
+def analyse_cards_market(stats_h: Optional[Dict],
+                          stats_a: Optional[Dict],
+                          fs_match: Optional[Dict]) -> Optional[Dict]:
+    """
+    Total Cartons Jaunes. Utilise FootyStats si disponible.
+    Retourne None si pas de données (évite les valeurs statiques).
+    """
+    if not fs_match:
+        return None
+
+    h_cards = maybe_float(fs_match.get("home_avg_cards") or
+                           fs_match.get("team_a_cards_avg"))
+    a_cards  = maybe_float(fs_match.get("away_avg_cards") or
+                            fs_match.get("team_b_cards_avg"))
+
+    if not h_cards or not a_cards:
+        return None  # Pas de données suffisantes
+
+    total_est = h_cards + a_cards
+    if total_est >= 4.5:
+        return {"market": "CARDS_OVER_3_5", "prob": 0.58,
+                "confidence": 12, "estimated_total": round(total_est, 1)}
+    if total_est <= 2.5:
+        return {"market": "CARDS_UNDER_3_5", "prob": 0.55,
+                "confidence": 10, "estimated_total": round(total_est, 1)}
+    return None
 
 # ============================================================
 # CORE ANALYSE — FIXTURE
@@ -1579,11 +1595,11 @@ def analyse_fixture_core(fixture_id: str,
         return None, 200
 
     # ---- 8. Marchés secondaires (BTTS, DC, O/U, Corners, Cards) ----
-    btts_signal   = analyse_btts_market(fs_match_data, h2h_data, hxg, axg)
-    dc_signal     = analyse_double_chance(dc_probs, odds_1x2, tier)
-    ou_signal     = analyse_over_under(fs_match_data, h2h_data, hxg, axg)
-    corners_signal= analyse_corners_market(stats_h, stats_a)
-    cards_signal  = analyse_cards_market(stats_h, stats_a)
+    btts_signal    = analyse_btts_market(fs_match_data, h2h_data, hxg, axg)
+    dc_signal      = analyse_double_chance(dc_probs, odds_1x2, tier)
+    ou_signal      = analyse_over_under(fs_match_data, h2h_data, hxg, axg)
+    corners_signal = analyse_corners_market(stats_h, stats_a, fs_match_data)
+    cards_signal   = analyse_cards_market(stats_h, stats_a, fs_match_data)
 
     secondary_markets = []
     for s in [btts_signal, dc_signal, ou_signal, corners_signal, cards_signal]:
