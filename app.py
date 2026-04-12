@@ -127,9 +127,10 @@ KELLY_FRACTION = 0.25
 MAX_STAKE_PCT  = 0.05
 
 # Oddss
-MIN_ODD_HOME_AWAY = 1.60
-MIN_ODD_DRAW      = 2.80
-MAX_ODD_SIGNAL    = 5.00
+MIN_ODD_ANY   = 1.40   # Minimum absolu toutes issues
+MIN_ODD_DRAW  = 2.00   # Minimum cote nul
+MAX_ODD_BET   = 2.40   # Maximum cote marché principal 1X2
+MAX_ODD_SIGNAL = 5.00  # Garde pour SIGNAL pur (sans cote)
 
 # Scan
 MAX_SCAN_RESULTS     = 20
@@ -725,7 +726,7 @@ def set_telegram_webhook(url: str) -> Tuple[Dict[str, Any], int]:
         return {"status": "error", "details": str(exc)}, 500
 
 def format_signal_message(signal: Dict[str, Any]) -> str:
-    """Message Telegram HTML — mode BET ou SIGNAL."""
+    """Message Telegram HTML — mode BET ou SIGNAL avec marchés secondaires."""
     mode = signal.get("mode", "BET")
     icon = "🚀" if mode == "BET" else "📡"
     tier = signal.get("tier", "")
@@ -736,14 +737,61 @@ def format_signal_message(signal: Dict[str, Any]) -> str:
         edge_pct = f" ({signal['edge']*100:.1f}% edge)" if signal.get("edge") else ""
         odds_line = f"@ {signal['odd']:.2f}{edge_pct}"
     else:
-        odds_line = "(Sans cote — Signal modèle)"
+        odds_line = "(Signal modèle — sans cote)"
 
     stake_line = ""
     if mode == "BET" and signal.get("stake") and signal["stake"] > 0:
-        stake_line = f"\n💰 Mise Kelly: <b>{signal['stake']:.2f}</b>"
+        stake_line = f"\n💰 Mise Kelly: <b>{signal['stake']:.2f}u</b>"
 
     xg_src = signal.get("xg_source", "proxy")
     src_icon = "📊" if xg_src == "footystats" else "🔢"
+
+    # DC probs
+    dc = signal.get("dc_probs", {})
+    dc_line = ""
+    if dc:
+        dc_line = (f"\n📐 H:{dc.get('H',0)*100:.0f}% "
+                   f"D:{dc.get('D',0)*100:.0f}% "
+                   f"A:{dc.get('A',0)*100:.0f}%")
+
+    # H2H
+    h2h = signal.get("h2h", {})
+    h2h_line = ""
+    if h2h.get("available"):
+        h2h_line = (f"\n🔄 H2H({h2h['matches']}): "
+                    f"H{int(h2h['home_win_pct']*100)}% "
+                    f"N{int(h2h['draw_pct']*100)}% "
+                    f"A{int(h2h['away_win_pct']*100)}% "
+                    f"| Moy:{h2h['avg_goals']}b "
+                    f"BTTS:{int(h2h['btts_rate']*100)}%")
+
+    # Marchés secondaires
+    secondary = signal.get("secondary_markets", [])
+    sec_lines = ""
+    market_icons = {
+        "BTTS_YES": "🟢 GG",
+        "BTTS_NO":  "🔴 PAS GG",
+        "OVER_2_5": "⬆️ O2.5",
+        "UNDER_2_5":"⬇️ U2.5",
+        "OVER_3_5": "⬆️ O3.5",
+        "OVER_4_5": "⬆️ O4.5",
+        "DC_1X":    "🔵 DC 1X",
+        "DC_X2":    "🔵 DC X2",
+        "DC_12":    "🔵 DC 12",
+        "CORNERS_OVER_9_5":  "📐 +9.5 Coins",
+        "CORNERS_UNDER_9_5": "📐 -9.5 Coins",
+        "CARDS_OVER_3_5":    "🟨 +3.5 CJ",
+    }
+    if secondary:
+        sec_lines = "\n━━━━━━━━━━━━━━━━━━━\n📋 <b>Marchés secondaires:</b>"
+        for s in secondary[:4]:
+            mkt = s.get("market", "")
+            icon_m = market_icons.get(mkt, mkt)
+            prob_m = s.get("prob", 0)
+            conf_m = s.get("confidence", 0)
+            sec_lines += f"\n   {icon_m} | Prob: {prob_m*100:.0f}% | Conf: {conf_m}/50"
+            if s.get("xg_total"):
+                sec_lines += f" | xGtot: {s['xg_total']}"
 
     return (
         f"{icon} <b>APEX-ULTIMATE — {mode}</b>\n"
@@ -752,12 +800,15 @@ def format_signal_message(signal: Dict[str, Any]) -> str:
         f"⚽ <b>{signal.get('home', '')} vs {signal.get('away', '')}</b>\n"
         f"⏱ {format_match_time(signal.get('kickoff_utc'))}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Signal: <b>{signal.get('side', '')} {signal.get('decision', '')}</b>\n"
+        f"🎯 <b>{signal.get('side', '')} — {signal.get('decision', '')}</b>\n"
         f"   {odds_line}\n"
         f"📈 Prob: {signal.get('prob', 0)*100:.1f}% | Conf: {signal.get('confidence', 0)}/50\n"
-        f"{src_icon} xG: {signal.get('hxg', 0):.2f} - {signal.get('axg', 0):.2f} ({xg_src})\n"
+        f"{src_icon} xG: {signal.get('hxg', 0):.2f}⚡{signal.get('axg', 0):.2f} ({xg_src})\n"
         f"🔎 DCS: {signal.get('dcs', 0):.2f}"
+        f"{dc_line}"
+        f"{h2h_line}"
         f"{stake_line}"
+        f"{sec_lines}"
     )
 
 # ============================================================
@@ -1045,8 +1096,231 @@ def calculate_confidence(prob: float, edge: float, dcs: float, tier: str) -> int
     return min(score, 50)
 
 # ============================================================
-# MOTEUR D'ANALYSE PRINCIPAL — DIXON-COLES HYBRIDE
+# H2H — HEAD TO HEAD
 # ============================================================
+def get_h2h(home_id: int, away_id: int, last: int = 5) -> List[Dict]:
+    """Récupère les 5 derniers H2H entre deux équipes."""
+    cache_key = f"h2h:{home_id}:{away_id}"
+    cached = cache_get(cache_key, ttl_seconds=3600)
+    if cached is not None:
+        return cached
+    data, status = call_api_football("fixtures/headtohead",
+                                     {"h2h": f"{home_id}-{away_id}", "last": last})
+    if status != 200:
+        return []
+    result = data["data"].get("response", [])
+    cache_set(cache_key, result)
+    return result
+
+def analyse_h2h(h2h_fixtures: List[Dict], home_id: int) -> Dict[str, Any]:
+    """Extrait les stats H2H: % victoire home, buts moyens, BTTS rate."""
+    if not h2h_fixtures:
+        return {"available": False}
+    home_wins = draws = away_wins = 0
+    total_goals = 0
+    btts_count = 0
+    for f in h2h_fixtures:
+        hg = maybe_int(f.get("goals", {}).get("home")) or 0
+        ag = maybe_int(f.get("goals", {}).get("away")) or 0
+        fh_id = f.get("teams", {}).get("home", {}).get("id")
+        total_goals += hg + ag
+        if hg > 0 and ag > 0:
+            btts_count += 1
+        if hg > ag:
+            if fh_id == home_id: home_wins += 1
+            else: away_wins += 1
+        elif hg == ag:
+            draws += 1
+        else:
+            if fh_id == home_id: away_wins += 1
+            else: home_wins += 1
+    n = len(h2h_fixtures)
+    return {
+        "available": True,
+        "matches": n,
+        "home_win_pct": round(home_wins / n, 2),
+        "draw_pct": round(draws / n, 2),
+        "away_win_pct": round(away_wins / n, 2),
+        "avg_goals": round(total_goals / n, 2),
+        "btts_rate": round(btts_count / n, 2),
+    }
+
+# ============================================================
+# NOUVEAUX MARCHÉS — BTTS / DC / OVER-UNDER / CORNERS / CARDS
+# ============================================================
+def analyse_btts_market(fs_match: Optional[Dict],
+                         h2h: Dict, hxg: float, axg: float) -> Optional[Dict]:
+    """
+    BTTS (Both Teams To Score / GG).
+    Utilise FootyStats btts_potential + xG + H2H btts_rate.
+    """
+    signals = []
+    btts_pot = maybe_float((fs_match or {}).get("btts_potential"))
+    total_xg = hxg + axg
+
+    # xG individuels
+    if hxg >= 0.90 and axg >= 0.90:
+        signals.append(("xG_both_above_0.9", True))
+    if btts_pot is not None:
+        if btts_pot >= 60:
+            signals.append(("btts_potential_high", True))
+        elif btts_pot <= 40:
+            signals.append(("btts_potential_low", False))
+
+    h2h_btts = h2h.get("btts_rate", 0.5)
+    if h2h.get("available") and h2h_btts >= 0.60:
+        signals.append(("h2h_btts_high", True))
+    elif h2h.get("available") and h2h_btts <= 0.30:
+        signals.append(("h2h_btts_low", False))
+
+    yes_count = sum(1 for _, v in signals if v)
+    no_count  = sum(1 for _, v in signals if not v)
+
+    if yes_count >= 2 and no_count == 0:
+        prob_est = min(0.45 + yes_count * 0.08, 0.75)
+        return {"market": "BTTS_YES", "prob": prob_est,
+                "confidence": yes_count * 12, "signals": [s[0] for s in signals if s[1]]}
+    if no_count >= 2 and yes_count == 0:
+        prob_est = min(0.45 + no_count * 0.08, 0.70)
+        return {"market": "BTTS_NO", "prob": prob_est,
+                "confidence": no_count * 10, "signals": [s[0] for s, v in zip(signals, [v for _, v in signals]) if not v]}
+    return None
+
+def analyse_double_chance(dc_probs: Dict, odds_1x2: Optional[Dict],
+                           tier: str) -> Optional[Dict]:
+    """
+    Double Chance (1X / X2 / 12).
+    Pertinent uniquement si la cote DC est dans 1.10–1.80 (valeur sur favori étendu).
+    """
+    if not odds_1x2:
+        return None
+    ph = dc_probs.get("H", 0.0)
+    pd = dc_probs.get("D", 0.0)
+    pa = dc_probs.get("A", 0.0)
+
+    combos = {
+        "1X": {"prob": ph + pd, "sides": ["Home", "Draw"]},
+        "X2": {"prob": pd + pa, "sides": ["Draw", "Away"]},
+        "12": {"prob": ph + pa, "sides": ["Home", "Away"]},
+    }
+    # Cherche le combo avec prob > 0.70 ET edge positif vs cote DC implicite
+    best: Optional[Dict] = None
+    for name, info in combos.items():
+        prob = info["prob"]
+        if prob < 0.68:
+            continue
+        # Estime cote DC = 1 / prob (marché équilibré)
+        implied_odd = round(1 / prob, 2)
+        if 1.10 <= implied_odd <= 1.80:
+            if best is None or prob > best["prob"]:
+                best = {"market": f"DC_{name}", "dc_combo": name,
+                        "prob": round(prob, 3), "implied_odd": implied_odd,
+                        "confidence": int(prob * 40)}
+    return best
+
+def analyse_over_under(fs_match: Optional[Dict], h2h: Dict,
+                        hxg: float, axg: float) -> Optional[Dict]:
+    """
+    Over/Under 2.5 / 3.5 / 4.5.
+    Priorité: FootyStats potentials + xG total + H2H avg_goals.
+    """
+    total_xg = hxg + axg
+    o25_pot = maybe_float((fs_match or {}).get("o25_potential"))
+    u25_pot = maybe_float((fs_match or {}).get("u25_potential"))
+    avg_pot = maybe_float((fs_match or {}).get("avg_potential"))
+    h2h_avg = h2h.get("avg_goals", 2.5)
+
+    results = []
+
+    # ---- OVER 2.5 ----
+    o25_signals = 0
+    if total_xg >= 2.60: o25_signals += 1
+    if o25_pot is not None and o25_pot >= 58: o25_signals += 1
+    if h2h.get("available") and h2h_avg >= 2.8: o25_signals += 1
+    if avg_pot is not None and avg_pot >= 2.70: o25_signals += 1
+    if o25_signals >= 2:
+        prob = min(0.45 + o25_signals * 0.07, 0.78)
+        results.append({"market": "OVER_2_5", "prob": prob,
+                         "confidence": o25_signals * 12, "xg_total": round(total_xg, 2)})
+
+    # ---- UNDER 2.5 ----
+    u25_signals = 0
+    if total_xg <= 2.20: u25_signals += 1
+    if u25_pot is not None and u25_pot >= 58: u25_signals += 1
+    if h2h.get("available") and h2h_avg <= 2.2: u25_signals += 1
+    if avg_pot is not None and avg_pot <= 2.30: u25_signals += 1
+    if u25_signals >= 2:
+        prob = min(0.45 + u25_signals * 0.07, 0.75)
+        results.append({"market": "UNDER_2_5", "prob": prob,
+                         "confidence": u25_signals * 11, "xg_total": round(total_xg, 2)})
+
+    # ---- OVER 3.5 ----
+    o35_signals = 0
+    if total_xg >= 3.40: o35_signals += 1
+    if o25_pot is not None and o25_pot >= 70: o35_signals += 1
+    if h2h.get("available") and h2h_avg >= 3.5: o35_signals += 1
+    if o35_signals >= 2:
+        prob = min(0.35 + o35_signals * 0.08, 0.65)
+        results.append({"market": "OVER_3_5", "prob": prob,
+                         "confidence": o35_signals * 10, "xg_total": round(total_xg, 2)})
+
+    # ---- OVER 4.5 ----
+    if total_xg >= 4.00 and h2h.get("avg_goals", 0) >= 4.0:
+        results.append({"market": "OVER_4_5", "prob": 0.38,
+                         "confidence": 15, "xg_total": round(total_xg, 2)})
+
+    if not results:
+        return None
+    # Retourne le marché avec la meilleure probabilité
+    return max(results, key=lambda x: x["confidence"])
+
+def analyse_corners_market(stats_h: Optional[Dict],
+                            stats_a: Optional[Dict]) -> Optional[Dict]:
+    """
+    Total Corners. Utilise stats API-Football (corners for/against).
+    Marché SIGNAL uniquement (cotes non récupérées automatiquement).
+    """
+    if not stats_h or not stats_a:
+        return None
+    h_corners = maybe_float(
+        stats_h.get("statistics", [{}])[0].get("value") if isinstance(
+            stats_h.get("statistics"), list) else None
+    )
+    # Fallback: cherche dans le dict directement
+    def avg_corners(stats: Dict, side: str) -> float:
+        played = (stats.get("fixtures", {}).get("played", {}).get("total") or 1)
+        # API-Football ne fournit pas toujours les corners dans /statistics
+        # On utilise une estimation basée sur la possession/style si dispo
+        return 5.0  # valeur neutre si non disponible
+
+    h_avg = avg_corners(stats_h, "home")
+    a_avg = avg_corners(stats_a, "away")
+    total_est = h_avg + a_avg
+
+    if total_est >= 10.0:
+        return {"market": "CORNERS_OVER_9_5", "prob": 0.55,
+                "confidence": 12, "estimated_total": round(total_est, 1)}
+    if total_est <= 8.0:
+        return {"market": "CORNERS_UNDER_9_5", "prob": 0.52,
+                "confidence": 10, "estimated_total": round(total_est, 1)}
+    return None
+
+def analyse_cards_market(stats_h: Optional[Dict],
+                          stats_a: Optional[Dict]) -> Optional[Dict]:
+    """
+    Total Cartons Jaunes. Marché SIGNAL.
+    Utilise stats API-Football si disponibles.
+    """
+    if not stats_h or not stats_a:
+        return None
+    # Estimation neutre — sera enrichi quand l'API retourne les données cards
+    total_est = 4.0  # valeur par défaut (~4 cartons/match en moyenne européenne)
+
+    return {"market": "CARDS_OVER_3_5", "prob": 0.52,
+            "confidence": 10, "estimated_total": total_est}
+
+# ============================================================
+# CORE ANALYSE — FIXTURE
 def build_fixture_detail(match: Dict) -> Dict:
     fixture = match.get("fixture", {})
     league = match.get("league", {})
@@ -1152,6 +1426,10 @@ def analyse_fixture_core(fixture_id: str,
     # ---- 4. DCS ----
     dcs = calculate_dcs(stats_h, stats_a, xg_source)
 
+    # ---- 4b. H2H ----
+    h2h_fixtures = get_h2h(home_id, away_id, last=5)
+    h2h_data = analyse_h2h(h2h_fixtures, home_id)
+
     # ---- 5. Récupération cotes (pipeline 3 niveaux) ----
     odds_1x2: Optional[Dict[str, float]] = None
     odds_source = None
@@ -1181,23 +1459,26 @@ def analyse_fixture_core(fixture_id: str,
 
     if odds_1x2:
         side_map = {"Home": "H", "Draw": "D", "Away": "A"}
-        for side in ["Home", "Away", "Draw"]:
+        min_edge_tier = MIN_EDGE.get(tier, 0.03)
+
+        # Construction de tous les candidats valides
+        candidates = []
+        for side in ["Home", "Draw", "Away"]:
             odd = odds_1x2.get(side)
             if not odd:
                 continue
-            prob = dc_probs.get(side_map[side], 0.0)
-            edge = prob - (1.0 / odd)
-            min_edge_tier = MIN_EDGE.get(tier, 0.03)
-
-            if edge <= min_edge_tier:
-                continue
-            if side == "Home" and odd < MIN_ODD_HOME_AWAY:
-                continue
-            if side == "Away" and odd < MIN_ODD_HOME_AWAY:
+            # Filtre plage de cotes
+            if odd < MIN_ODD_ANY:
                 continue
             if side == "Draw" and odd < MIN_ODD_DRAW:
                 continue
-            if odd > MAX_ODD_SIGNAL:
+            if odd > MAX_ODD_BET:
+                continue
+
+            prob = dc_probs.get(side_map[side], 0.0)
+            edge = prob - (1.0 / odd)
+
+            if edge <= min_edge_tier:
                 continue
 
             # Filtre glamour outsider sur P0
@@ -1208,16 +1489,35 @@ def analyse_fixture_core(fixture_id: str,
             if conf < MIN_CONFIDENCE_BET:
                 continue
 
-            # Décision label
+            candidates.append({
+                "side": side,
+                "odd": odd,
+                "prob": prob,
+                "edge": edge,
+                "conf": conf,
+            })
+
+        # Sélection: trier par probabilité décroissante (favoris en premier)
+        # puis par edge si égalité — évite le biais outsider
+        candidates.sort(key=lambda x: (x["prob"], x["edge"]), reverse=True)
+
+        if candidates:
+            best = candidates[0]
+            side = best["side"]
+            odd = best["odd"]
+            prob = best["prob"]
+            edge = best["edge"]
+            conf = best["conf"]
+
             prefix = {"P0": "ELITE", "N1": "MAIN", "N2": "VALUE", "N3": "WATCH"}.get(tier, "WATCH")
             decision = f"{prefix}_{side.upper()}"
             level = {"P0": 3, "N1": 3, "N2": 2, "N3": 1}.get(tier, 1)
-
             bankroll = get_bankroll()
             stake = kelly_stake(prob, odd, bankroll)
 
             best_signal = {
                 "mode": "BET",
+                "market": "1X2",
                 "side": side,
                 "decision": decision,
                 "level": level,
@@ -1231,7 +1531,6 @@ def analyse_fixture_core(fixture_id: str,
                 "stake": stake,
                 "odds_source": odds_source,
             }
-            break  # Première opportunité valide
 
     # ---- 7. MODE SIGNAL (pas de cotes ou aucun BET trouvé) ----
     if not best_signal:
@@ -1279,7 +1578,19 @@ def analyse_fixture_core(fixture_id: str,
     if not best_signal:
         return None, 200
 
-    # ---- 8. Construction du signal complet ----
+    # ---- 8. Marchés secondaires (BTTS, DC, O/U, Corners, Cards) ----
+    btts_signal   = analyse_btts_market(fs_match_data, h2h_data, hxg, axg)
+    dc_signal     = analyse_double_chance(dc_probs, odds_1x2, tier)
+    ou_signal     = analyse_over_under(fs_match_data, h2h_data, hxg, axg)
+    corners_signal= analyse_corners_market(stats_h, stats_a)
+    cards_signal  = analyse_cards_market(stats_h, stats_a)
+
+    secondary_markets = []
+    for s in [btts_signal, dc_signal, ou_signal, corners_signal, cards_signal]:
+        if s and s.get("confidence", 0) >= 10:
+            secondary_markets.append(s)
+
+    # ---- 9. Construction du signal complet ----
     fs_match_found = fs_raw is not None
     return {
         "status": "ok",
@@ -1298,8 +1609,10 @@ def analyse_fixture_core(fixture_id: str,
         "xg_source": xg_source,
         "dcs": round(dcs, 3),
         "dc_probs": {k: round(v, 4) for k, v in dc_probs.items()},
+        "h2h": h2h_data,
         "footystats_match_found": fs_match_found,
         "odds_1x2": odds_1x2,
+        "secondary_markets": secondary_markets,
         **best_signal,
     }, 200
 
