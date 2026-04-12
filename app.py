@@ -48,7 +48,7 @@ AUTO_RESOLVE_ENABLED = os.environ.get("AUTO_RESOLVE_ENABLED", "1") == "1"
 RESOLVE_BATCH_LIMIT  = int(os.environ.get("RESOLVE_BATCH_LIMIT", "200"))
 
 ENABLE_SCHEDULER     = os.environ.get("ENABLE_SCHEDULER", "1") == "1"
-SCAN_COOLDOWN_SECONDS= int(os.environ.get("SCAN_COOLDOWN_SECONDS", "120"))
+SCAN_COOLDOWN_SECONDS= int(os.environ.get("SCAN_COOLDOWN_SECONDS", "300"))
 SCAN_START_HOUR      = int(os.environ.get("SCAN_START_HOUR", "7"))
 SCAN_END_HOUR        = int(os.environ.get("SCAN_END_HOUR", "23"))
 
@@ -1704,6 +1704,10 @@ def _run_full_scan_job_core(trigger: str = "scheduler") -> int:
         raise RuntimeError(f"get_fixtures_by_date failed: status={fixtures_status}")
 
     fixtures = fixtures_data["data"].get("response", [])
+    if not fixtures:
+        logger.warning("Scan %s | get_fixtures_by_date returned empty response — possible API quota/rate-limit", trigger)
+        send_telegram_message(f"⚠️ Scan {trigger} {timestamp}\nAPI-Football: réponse vide (quota ou rate-limit). Réessaie dans quelques minutes.")
+        return 0
     fs_matches = get_footystats_matches_cached()
     standings_cache: Dict[Tuple, Any] = {}
 
