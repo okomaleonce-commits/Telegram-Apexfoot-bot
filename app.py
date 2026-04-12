@@ -115,11 +115,11 @@ LEAGUE_CONFIG: Dict[int, Dict[str, Any]] = {
 TARGET_LEAGUE_IDS = list(LEAGUE_CONFIG.keys())
 
 # Seuils d'edge minimum par tier
-MIN_EDGE: Dict[str, float] = {"P0": 0.04, "N1": 0.04, "N2": 0.03, "N3": 0.02}
+MIN_EDGE: Dict[str, float] = {"P0": 0.03, "N1": 0.03, "N2": 0.02, "N3": 0.015}
 
 # Seuils de confiance
-MIN_CONFIDENCE_BET    = 15  # Mode BET (cotes disponibles)
-MIN_CONFIDENCE_SIGNAL = 20  # Mode SIGNAL (sans cotes, seuil plus strict)
+MIN_CONFIDENCE_BET    = 10  # Mode BET (cotes disponibles)
+MIN_CONFIDENCE_SIGNAL = 15  # Mode SIGNAL (sans cotes)
 MIN_PROB_SIGNAL       = 0.55
 
 # Kelly
@@ -129,8 +129,8 @@ MAX_STAKE_PCT  = 0.05
 # Oddss
 MIN_ODD_ANY   = 1.40   # Minimum absolu toutes issues
 MIN_ODD_DRAW  = 2.00   # Minimum cote nul
-MAX_ODD_BET   = 2.40   # Maximum cote marché principal 1X2
-MAX_ODD_SIGNAL = 5.00  # Garde pour SIGNAL pur (sans cote)
+MAX_ODD_BET   = 3.80   # Maximum cote marché principal (favoris + légèrs outsiders)
+MAX_ODD_SIGNAL = 5.50  # Garde pour SIGNAL pur (sans cote)
 
 # Scan
 MAX_SCAN_RESULTS     = 20
