@@ -1,3 +1,9 @@
+"""
+APEX-HYBRID-ULTIMATE v2.0
+Fusion de :
+  - app.py existant (prod-safe: HTTP retry, SCAN_LOCK, webhook, journalisation, résolution)
+  - Nouveau moteur (Dixon-Coles, LEAGUE_CONFIG, Kelly, tiers, smart stats, dual mode BET/SIGNAL)
+"""
 
 import os
 import re
@@ -6,10 +12,11 @@ import time
 import math
 import logging
 import sqlite3
+import hashlib
 import threading
 import unicodedata
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,39 +29,140 @@ from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 
-# Init SQLite DB at startup
-# (called after all functions are defined — see bottom of CONFIG block)
-
 # ============================================================
-# CONFIG
+# CONFIG — Environnement
 # ============================================================
-BUILD_ID = "apex-hybrid-footystats-2026-04-08-02"
+BUILD_ID = "apex-hybrid-ultimate-v2.0"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-API_KEY = os.environ.get("API_KEY")
-FOOTYSTATS_KEY = os.environ.get("FOOTYSTATS_KEY")
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
+CHAT_ID   = os.environ.get("CHAT_ID")
+API_KEY   = os.environ.get("API_KEY")
+FOOTYSTATS_KEY      = os.environ.get("FOOTYSTATS_KEY")
+ODDS_API_KEY        = os.environ.get("ODDS_API_KEY")
 ODDS_API_BOOKMAKERS = os.environ.get("ODDS_API_BOOKMAKERS", "bet365,unibet")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 
-DB_PATH = os.environ.get("DB_PATH", "/tmp/apex_signals.db")
+DB_PATH              = os.environ.get("DB_PATH", "/tmp/apex_signals.db")
+DEFAULT_BANKROLL     = float(os.environ.get("DEFAULT_BANKROLL", "100.0"))
 AUTO_RESOLVE_ENABLED = os.environ.get("AUTO_RESOLVE_ENABLED", "1") == "1"
-DEFAULT_STAKE = float(os.environ.get("DEFAULT_STAKE", "1.0"))
-RESOLVE_BATCH_LIMIT = int(os.environ.get("RESOLVE_BATCH_LIMIT", "200"))
+RESOLVE_BATCH_LIMIT  = int(os.environ.get("RESOLVE_BATCH_LIMIT", "200"))
 
-ENABLE_SCHEDULER = os.environ.get("ENABLE_SCHEDULER", "1") == "1"
-SCAN_COOLDOWN_SECONDS = int(os.environ.get("SCAN_COOLDOWN_SECONDS", "120"))
-HTTP_RETRY_TOTAL = int(os.environ.get("HTTP_RETRY_TOTAL", "3"))
+ENABLE_SCHEDULER     = os.environ.get("ENABLE_SCHEDULER", "1") == "1"
+SCAN_COOLDOWN_SECONDS= int(os.environ.get("SCAN_COOLDOWN_SECONDS", "120"))
+SCAN_START_HOUR      = int(os.environ.get("SCAN_START_HOUR", "7"))
+SCAN_END_HOUR        = int(os.environ.get("SCAN_END_HOUR", "23"))
+
+HTTP_RETRY_TOTAL    = int(os.environ.get("HTTP_RETRY_TOTAL", "3"))
 HTTP_BACKOFF_FACTOR = float(os.environ.get("HTTP_BACKOFF_FACTOR", "0.7"))
 
+# ============================================================
+# CONFIG — Ligues (tiers, home_adv, rho Dixon-Coles)
+# ============================================================
+LEAGUE_CONFIG: Dict[int, Dict[str, Any]] = {
+    # P0 — UEFA
+    2:   {"tier": "P0", "name": "UEFA Champions League",          "home_adv": 1.25, "rho": -0.13},
+    3:   {"tier": "P0", "name": "UEFA Europa League",             "home_adv": 1.25, "rho": -0.13},
+    848: {"tier": "P0", "name": "UEFA Europa Conference League",  "home_adv": 1.25, "rho": -0.13},
+    17:  {"tier": "P0", "name": "AFC Champions League",           "home_adv": 1.20, "rho": -0.13},
+    # N1 — Top 5 + grands championnats
+    39:  {"tier": "N1", "name": "Premier League",          "home_adv": 1.08, "rho": -0.13},
+    140: {"tier": "N1", "name": "La Liga",                 "home_adv": 1.12, "rho": -0.13},
+    78:  {"tier": "N1", "name": "Bundesliga",              "home_adv": 1.10, "rho": -0.13},
+    135: {"tier": "N1", "name": "Serie A",                 "home_adv": 1.13, "rho": -0.13},
+    61:  {"tier": "N1", "name": "Ligue 1",                 "home_adv": 1.11, "rho": -0.13},
+    # N2 — Ligues secondaires
+    40:  {"tier": "N2", "name": "Championship",            "home_adv": 1.14, "rho": -0.13},
+    62:  {"tier": "N2", "name": "Ligue 2",                 "home_adv": 1.12, "rho": -0.13},
+    79:  {"tier": "N2", "name": "2. Bundesliga",           "home_adv": 1.10, "rho": -0.13},
+    136: {"tier": "N2", "name": "Serie B",                 "home_adv": 1.12, "rho": -0.13},
+    88:  {"tier": "N2", "name": "Eredivisie",              "home_adv": 1.09, "rho": -0.13},
+    94:  {"tier": "N2", "name": "Primeira Liga",           "home_adv": 1.11, "rho": -0.13},
+    203: {"tier": "N2", "name": "Süper Lig",               "home_adv": 1.14, "rho": -0.13},
+    71:  {"tier": "N2", "name": "Serie A Brazil",          "home_adv": 1.18, "rho": -0.16},
+    128: {"tier": "N2", "name": "Primera Division Arg.",   "home_adv": 1.20, "rho": -0.18},
+    # N3 — Autres
+    41:  {"tier": "N3", "name": "League One",              "home_adv": 1.12, "rho": -0.13},
+    95:  {"tier": "N3", "name": "Liga Portugal B",         "home_adv": 1.10, "rho": -0.13},
+    89:  {"tier": "N3", "name": "Eredivisie B",            "home_adv": 1.10, "rho": -0.13},
+    113: {"tier": "N3", "name": "Allsvenskan",             "home_adv": 1.10, "rho": -0.13},
+    119: {"tier": "N3", "name": "Superliga Denmark",       "home_adv": 1.10, "rho": -0.13},
+    103: {"tier": "N3", "name": "Eliteserien Norway",      "home_adv": 1.10, "rho": -0.13},
+    106: {"tier": "N3", "name": "Veikkausliiga Finland",   "home_adv": 1.10, "rho": -0.13},
+    179: {"tier": "N3", "name": "Scottish Premiership",   "home_adv": 1.12, "rho": -0.13},
+    197: {"tier": "N3", "name": "Super League Greece",     "home_adv": 1.13, "rho": -0.13},
+    207: {"tier": "N3", "name": "Jupiler Pro League",      "home_adv": 1.11, "rho": -0.13},
+    218: {"tier": "N3", "name": "Fortuna Liga",            "home_adv": 1.10, "rho": -0.13},
+    235: {"tier": "N3", "name": "Ukrainian Premier League","home_adv": 1.10, "rho": -0.13},
+    72:  {"tier": "N3", "name": "Brasileirão Serie B",     "home_adv": 1.16, "rho": -0.16},
+    233: {"tier": "N3", "name": "Egyptian Premier League", "home_adv": 1.15, "rho": -0.14},
+    307: {"tier": "N3", "name": "Saudi Pro League",        "home_adv": 1.17, "rho": -0.14},
+    301: {"tier": "N3", "name": "AFC Cup",                 "home_adv": 1.18, "rho": -0.13},
+    98:  {"tier": "N3", "name": "J-League",                "home_adv": 1.10, "rho": -0.13},
+    292: {"tier": "N3", "name": "K-League",                "home_adv": 1.10, "rho": -0.13},
+    210: {"tier": "N3", "name": "Super Lig (2nd)",         "home_adv": 1.13, "rho": -0.13},
+    188: {"tier": "N3", "name": "Bundesliga Austria",      "home_adv": 1.11, "rho": -0.13},
+    239: {"tier": "N3", "name": "Premier League Russia",   "home_adv": 1.12, "rho": -0.13},
+    265: {"tier": "N3", "name": "Liga MX",                 "home_adv": 1.16, "rho": -0.15},
+    262: {"tier": "N3", "name": "MLS",                     "home_adv": 1.10, "rho": -0.13},
+    253: {"tier": "N3", "name": "USL Championship",        "home_adv": 1.10, "rho": -0.13},
+    242: {"tier": "N3", "name": "Ligue Professionnelle 1", "home_adv": 1.14, "rho": -0.14},
+    343: {"tier": "N3", "name": "Süper Lig (Cyprus)",      "home_adv": 1.14, "rho": -0.13},
+    164: {"tier": "N3", "name": "Ekstraklasa",             "home_adv": 1.12, "rho": -0.13},
+    244: {"tier": "N3", "name": "NB I Hungary",            "home_adv": 1.12, "rho": -0.13},
+    328: {"tier": "N3", "name": "Botola Pro",              "home_adv": 1.15, "rho": -0.14},
+}
+
+TARGET_LEAGUE_IDS = list(LEAGUE_CONFIG.keys())
+
+# Seuils d'edge minimum par tier
+MIN_EDGE: Dict[str, float] = {"P0": 0.04, "N1": 0.04, "N2": 0.03, "N3": 0.02}
+
+# Seuils de confiance
+MIN_CONFIDENCE_BET    = 15  # Mode BET (cotes disponibles)
+MIN_CONFIDENCE_SIGNAL = 20  # Mode SIGNAL (sans cotes, seuil plus strict)
+MIN_PROB_SIGNAL       = 0.55
+
+# Kelly
+KELLY_FRACTION = 0.25
+MAX_STAKE_PCT  = 0.05
+
+# Oddss
+MIN_ODD_HOME_AWAY = 1.60
+MIN_ODD_DRAW      = 2.80
+MAX_ODD_SIGNAL    = 5.00
+
+# Scan
+MAX_SCAN_RESULTS     = 20
+MIN_SIGNAL_LEVEL_AUTO = 2
+
+# Glamour teams (biais outsider)
+GLAMOUR_NAMES = {
+    "liverpool", "real madrid", "barcelona", "bayern munich", "psg",
+    "paris saint germain", "manchester city", "manchester united",
+    "arsenal", "chelsea", "juventus", "inter", "ac milan",
+}
+
+EXCLUDED_KEYWORDS = [
+    "youth", "u17", "u18", "u19", "u20", "u21", "u23",
+    "women", "feminine", "female", "reserve", "reserves", "b team", "ii",
+]
+
+# Mapping pays → ligue domestique (pour fallback UEFA)
+COUNTRY_TO_LEAGUE: Dict[str, int] = {
+    "England": 39, "Spain": 140, "Germany": 78, "Italy": 135,
+    "France": 61, "Portugal": 94, "Netherlands": 88, "Turkey": 203,
+}
+
+# ============================================================
+# LOGGING & ÉTAT
+# ============================================================
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("apexbot")
 
-SCAN_LOCK = threading.Lock()
+SCAN_LOCK: threading.Lock = threading.Lock()
 SCAN_STATE: Dict[str, Any] = {
     "running": False,
     "started_at": None,
@@ -64,57 +172,6 @@ SCAN_STATE: Dict[str, Any] = {
     "last_signals_sent": 0,
     "last_manual_trigger_at": None,
 }
-
-API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
-FOOTYSTATS_BASE_URL = "https://api.football-data-api.com"
-ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
-
-REQUEST_TIMEOUT = 20
-CACHE_TTL_SECONDS = 600
-
-EXCLUDED_KEYWORDS = [
-    "youth", "u17", "u18", "u19", "u20", "u21", "u23",
-    "women", "feminine", "female",
-    "reserve", "reserves", "b team", "ii",
-]
-
-TARGET_LEAGUE_IDS = [
-    39, 40, 41, 140, 78, 79, 135, 136, 61, 62, 2, 3, 848, 94, 95, 88, 89,
-    203, 197, 207, 113, 119, 103, 106, 179, 218, 235, 72, 210, 328, 244, 164,
-    128, 71, 239, 265, 262, 253, 233, 242, 343, 307, 301, 98, 292, 17, 188,
-]
-
-ELITE_LEAGUE_IDS = {2, 3, 848, 17}
-
-LEVELS_1X2 = {
-    1: {"name": "WATCHLIST", "edge_min": 0.03},
-    2: {"name": "VALUE", "edge_min": 0.05},
-    3: {"name": "MAIN", "edge_min": 0.08},
-}
-LEVELS_GOALS = {
-    1: {"name": "WATCHLIST", "confidence_min": 2},
-    2: {"name": "VALUE", "confidence_min": 3},
-    3: {"name": "MAIN", "confidence_min": 5},
-}
-
-MIN_ODD_HOME_AWAY = 1.60
-MIN_ODD_DRAW = 2.80
-MAX_ODD_MAIN_SIGNAL = 4.50
-SCAN_START_HOUR = 7   # UTC == heure locale Abidjan (GMT+0)
-SCAN_END_HOUR = 23
-MIN_SIGNAL_LEVEL_AUTO = 2  # Niveau minimum pour envoi auto Telegram
-
-MAX_SCAN_RESULTS = 20
-
-# teams that often create fake glamour-away value when the model is too naive
-GLAMOUR_NAMES = {
-    "liverpool", "real madrid", "barcelona", "bayern munich", "psg",
-    "paris saint germain", "manchester city", "manchester united",
-    "arsenal", "chelsea", "juventus", "inter", "ac milan",
-}
-
-_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
-
 
 # ============================================================
 # HTTP SESSION PARTAGÉE (retry + backoff)
@@ -135,50 +192,53 @@ def build_http_session() -> requests.Session:
     session.mount("http://", adapter)
     return session
 
-
 HTTP = build_http_session()
 
+# ============================================================
+# URLS API
+# ============================================================
+API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
+FOOTYSTATS_BASE_URL   = "https://api.football-data-api.com"
+ODDS_API_BASE_URL     = "https://api.the-odds-api.com/v4"
+
+REQUEST_TIMEOUT    = 20
+CACHE_TTL_SECONDS  = 600
+_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# Cache FootyStats intra-session
+_FS_MATCHES_CACHE: List[Dict[str, Any]] = []
+_FS_CACHE_TS: float = 0.0
+_FS_TTL: float = 25 * 60.0
 
 # ============================================================
-# GENERIC
+# FLASK HELPERS
 # ============================================================
 def ok(payload: Dict[str, Any], status_code: int = 200):
     return jsonify(payload), status_code
-
 
 def err(message: str, status_code: int = 400, **kwargs):
     payload = {"status": "error", "message": message}
     payload.update(kwargs)
     return jsonify(payload), status_code
 
-
 @app.errorhandler(HTTPException)
 def handle_http_exception(e):
-    return jsonify({
-        "status": "error",
-        "message": e.name,
-        "details": e.description,
-        "build_id": BUILD_ID,
-    }), e.code
-
+    return jsonify({"status": "error", "message": e.name,
+                    "details": e.description, "build_id": BUILD_ID}), e.code
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    return jsonify({
-        "status": "error",
-        "message": "Unhandled server exception",
-        "details": str(e),
-        "build_id": BUILD_ID,
-    }), 500
+    return jsonify({"status": "error", "message": "Unhandled server exception",
+                    "details": str(e), "build_id": BUILD_ID}), 500
 
-
+# ============================================================
+# UTILS TEMPORELS
+# ============================================================
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def utc_today_str() -> str:
     return now_utc().strftime("%Y-%m-%d")
-
 
 def parse_iso_date(iso_date: Optional[str]) -> Optional[datetime]:
     if not iso_date:
@@ -188,14 +248,15 @@ def parse_iso_date(iso_date: Optional[str]) -> Optional[datetime]:
     except Exception:
         return None
 
-
-def format_match_time(iso_date: Optional[str]) -> Optional[str]:
+def format_match_time(iso_date: Optional[str]) -> str:
     dt = parse_iso_date(iso_date)
     if not dt:
-        return iso_date
+        return iso_date or ""
     return dt.astimezone(timezone.utc).strftime("%H:%M UTC")
 
-
+# ============================================================
+# UTILS NUMÉRIQUES
+# ============================================================
 def maybe_float(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -203,11 +264,9 @@ def maybe_float(value: Any) -> Optional[float]:
         f = float(value)
     except (TypeError, ValueError):
         return None
-    # Sentinel values used by API-Football for "N/A"
     if f in (-1.0, -2.0) or str(value).strip() in ("", "-1", "-2"):
         return None
     return f
-
 
 def maybe_int(value: Any) -> Optional[int]:
     if value is None:
@@ -220,25 +279,16 @@ def maybe_int(value: Any) -> Optional[int]:
         return None
     return int(f)
 
-
 def safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
     if a is None or b in (None, 0):
         return None
     return a / b
-
-
-def count_wins(form_string: Optional[str]) -> int:
-    if not form_string:
-        return 0
-    return str(form_string).count("W")
-
 
 def implied_probability(decimal_odd: Optional[Any]) -> Optional[float]:
     odd = maybe_float(decimal_odd)
     if odd is None or odd <= 0:
         return None
     return 1.0 / odd
-
 
 def normalize_probabilities(prob_dict: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
     valid_values = [v for v in prob_dict.values() if v is not None]
@@ -247,37 +297,113 @@ def normalize_probabilities(prob_dict: Dict[str, Optional[float]]) -> Dict[str, 
         return {k: None for k in prob_dict}
     return {k: (v / total if v is not None else None) for k, v in prob_dict.items()}
 
+# ============================================================
+# UTILS TEXTE / NOMS
+# ============================================================
+def normalize_name(name: Optional[str]) -> str:
+    """Normalisation avancée: suppression accents + stopwords + suffixes."""
+    text = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode("ascii")
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    stop = {
+        "fc", "cf", "sc", "afc", "ac", "club", "deportivo", "futbol",
+        "football", "soccer", "united", "city", "town", "athletic",
+        "sporting", "the", "de", "du", "el", "al",
+    }
+    tokens = [t for t in text.split() if t not in stop]
+    return " ".join(tokens).strip()
 
-def weighted_blend_probabilities(
-    left: Dict[str, Optional[float]],
-    right: Dict[str, Optional[float]],
-    left_weight: float,
-    right_weight: float,
-) -> Dict[str, Optional[float]]:
-    raw: Dict[str, Optional[float]] = {}
-    for key in ["Home", "Draw", "Away"]:
-        lv = left.get(key)
-        rv = right.get(key)
-        if lv is None and rv is None:
-            raw[key] = None
-        elif lv is None:
-            raw[key] = rv
-        elif rv is None:
-            raw[key] = lv
-        else:
-            raw[key] = lv * left_weight + rv * right_weight
-    return normalize_probabilities(raw)
+def team_name_similarity(left: Optional[str], right: Optional[str]) -> float:
+    a = normalize_name(left)
+    b = normalize_name(right)
+    if not a or not b:
+        return 0.0
+    ratio = SequenceMatcher(None, a, b).ratio()
+    ta = set(a.split())
+    tb = set(b.split())
+    token_score = len(ta & tb) / max(len(ta | tb), 1)
+    if a == b:
+        return 1.0
+    return max(ratio, token_score)
 
+def kickoff_similarity(api_date: Optional[str], unix_ts: Optional[Any]) -> float:
+    dt = parse_iso_date(api_date)
+    ts = maybe_float(unix_ts)
+    if not dt or ts is None:
+        return 0.0
+    delta_minutes = abs(dt.timestamp() - ts) / 60.0
+    if delta_minutes <= 5:   return 1.0
+    if delta_minutes <= 20:  return 0.9
+    if delta_minutes <= 60:  return 0.7
+    if delta_minutes <= 180: return 0.45
+    return 0.0
 
-def compute_edges(model_probs: Dict[str, Optional[float]], market_probs: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
-    result = {}
-    for key in ["Home", "Draw", "Away"]:
-        mp = model_probs.get(key)
-        bp = market_probs.get(key)
-        result[key] = None if mp is None or bp is None else mp - bp
-    return result
+def is_glamour_team(name: Optional[str]) -> bool:
+    return normalize_name(name) in {normalize_name(x) for x in GLAMOUR_NAMES}
 
+def json_dumps_safe(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return json.dumps(str(value), ensure_ascii=False)
 
+def count_wins(form_string: Optional[str]) -> int:
+    if not form_string:
+        return 0
+    return str(form_string).count("W")
+
+# ============================================================
+# MATHS — DIXON-COLES + KELLY
+# ============================================================
+def poisson_pmf(lmb: float, k: int) -> float:
+    if lmb <= 0:
+        return 1.0 if k == 0 else 0.0
+    return math.exp(-lmb) * (lmb ** k) / math.factorial(k)
+
+def calculate_probs_dc(hxg: float, axg: float, league_id: int) -> Dict[str, float]:
+    """Modèle Dixon-Coles: probabilités Home/Draw/Away avec correction rho."""
+    cfg = LEAGUE_CONFIG.get(league_id, {"rho": -0.13})
+    rho = cfg["rho"]
+
+    hp = [poisson_pmf(hxg, i) for i in range(7)]
+    ap = [poisson_pmf(axg, i) for i in range(7)]
+
+    probs: Dict[str, float] = {"H": 0.0, "D": 0.0, "A": 0.0}
+
+    for h in range(7):
+        for a in range(7):
+            # Correction Dixon-Coles scores bas
+            if   h == 0 and a == 0: tau = 1.0 - (hxg * axg * rho)
+            elif h == 1 and a == 0: tau = 1.0 + (axg * rho)
+            elif h == 0 and a == 1: tau = 1.0 + (hxg * rho)
+            elif h == 1 and a == 1: tau = 1.0 - rho
+            else:                   tau = 1.0
+
+            p = max(hp[h] * ap[a] * tau, 0.0)
+            if   h > a: probs["H"] += p
+            elif h == a: probs["D"] += p
+            else:        probs["A"] += p
+
+    total = sum(probs.values())
+    if total > 0:
+        probs = {k: v / total for k, v in probs.items()}
+    return probs
+
+def kelly_stake(prob: float, odd: float, bankroll: float) -> float:
+    """Critère de Kelly fractionné."""
+    if not odd or odd <= 1.0:
+        return 0.0
+    b = odd - 1.0
+    q = 1.0 - prob
+    f = (b * prob - q) / b
+    if f <= 0:
+        return 0.0
+    raw = bankroll * KELLY_FRACTION * f
+    return round(min(raw, bankroll * MAX_STAKE_PCT), 2)
+
+# ============================================================
+# CACHE MÉMOIRE
+# ============================================================
 def cache_get(key: str, ttl_seconds: int = CACHE_TTL_SECONDS) -> Optional[Any]:
     item = _MEMORY_CACHE.get(key)
     if not item:
@@ -287,178 +413,641 @@ def cache_get(key: str, ttl_seconds: int = CACHE_TTL_SECONDS) -> Optional[Any]:
         return None
     return item["data"]
 
-
-def cache_set(key: str, data: Any):
+def cache_set(key: str, data: Any) -> None:
     _MEMORY_CACHE[key] = {"ts": time.time(), "data": data}
 
+# ============================================================
+# SQLITE — DB
+# ============================================================
+def db_connect() -> sqlite3.Connection:
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Cannot create DB dir %s: %s — falling back to /tmp", db_dir, exc)
+            fallback = os.path.join("/tmp", os.path.basename(DB_PATH))
+            conn = sqlite3.connect(fallback, timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            return conn
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def normalize_name(name: Optional[str]) -> str:
-    text = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode("ascii")
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    tokens = [
-        t for t in text.split()
-        if t not in {
-            "fc", "cf", "sc", "afc", "ac", "club", "deportivo",
-            "the", "futbol", "football", "soccer",
-        }
-    ]
-    return " ".join(tokens).strip()
+def init_db() -> None:
+    try:
+        with closing(db_connect()) as conn:
+            # Table signaux
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_uid TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                build_id TEXT NOT NULL,
+                fixture_id INTEGER NOT NULL,
+                match_date TEXT,
+                kickoff_utc TEXT,
+                league_id INTEGER,
+                league_name TEXT,
+                tier TEXT,
+                country TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                market TEXT,
+                side TEXT,
+                mode TEXT DEFAULT 'BET',
+                decision TEXT NOT NULL,
+                level INTEGER NOT NULL,
+                level_name TEXT,
+                odd REAL,
+                raw_edge REAL,
+                adjusted_edge REAL,
+                prob REAL,
+                hxg REAL,
+                axg REAL,
+                xg_source TEXT,
+                dcs REAL,
+                confidence INTEGER,
+                confluence_count INTEGER,
+                confidence_count INTEGER,
+                rationale TEXT,
+                contextual_flags TEXT,
+                contextual_penalties TEXT,
+                telegram_sent INTEGER DEFAULT 0,
+                telegram_http_status INTEGER,
+                telegram_message_id TEXT,
+                result_status TEXT DEFAULT 'pending',
+                match_status TEXT,
+                home_goals INTEGER,
+                away_goals INTEGER,
+                bet_outcome TEXT,
+                stake REAL DEFAULT 0.0,
+                profit REAL DEFAULT 0.0,
+                resolved_at TEXT
+            )
+            """)
+            # Table bankroll
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS bankroll (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                amount REAL NOT NULL
+            )
+            """)
+            conn.execute("INSERT OR IGNORE INTO bankroll (id, amount) VALUES (1, ?)",
+                         (DEFAULT_BANKROLL,))
+            # Index
+            for idx_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_signals_fixture_id ON signals(fixture_id)",
+                "CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_signals_result_status ON signals(result_status)",
+                "CREATE INDEX IF NOT EXISTS idx_signals_level ON signals(level)",
+                "CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market)",
+                "CREATE INDEX IF NOT EXISTS idx_signals_tier ON signals(tier)",
+                "CREATE INDEX IF NOT EXISTS idx_signals_mode ON signals(mode)",
+            ]:
+                conn.execute(idx_sql)
+            conn.commit()
+            logger.info("DB ready at %s", DB_PATH)
+    except Exception as exc:
+        logger.error("init_db failed: %s — bot will start but DB may be unavailable", exc)
 
+def get_bankroll() -> float:
+    try:
+        with closing(db_connect()) as conn:
+            row = conn.execute("SELECT amount FROM bankroll WHERE id=1").fetchone()
+            return float(row["amount"]) if row else DEFAULT_BANKROLL
+    except Exception as e:
+        logger.error("get_bankroll error: %s", e)
+        return DEFAULT_BANKROLL
 
-def team_name_similarity(left: Optional[str], right: Optional[str]) -> float:
-    a = normalize_name(left)
-    b = normalize_name(right)
-    if not a or not b:
-        return 0.0
+def set_bankroll(amount: float) -> None:
+    try:
+        with closing(db_connect()) as conn:
+            conn.execute("UPDATE bankroll SET amount=? WHERE id=1", (round(amount, 2),))
+            conn.commit()
+    except Exception as e:
+        logger.error("set_bankroll error: %s", e)
 
-    ratio = SequenceMatcher(None, a, b).ratio()
-    ta = set(a.split())
-    tb = set(b.split())
-    token_score = len(ta & tb) / max(len(ta | tb), 1)
+# ============================================================
+# JOURNALISATION SIGNAUX
+# ============================================================
+def build_signal_uid(fixture_id, market, side, decision, level, kickoff_utc) -> str:
+    match_day = str(kickoff_utc or "")[:10]
+    return "|".join([str(BUILD_ID), str(fixture_id), str(match_day),
+                     str(market or ""), str(side or ""), str(decision or ""), str(level or 0)])
 
-    if a == b:
-        return 1.0
-    return max(ratio, token_score)
+def extract_telegram_message_id(tg_data: Optional[Dict]) -> Optional[str]:
+    if not isinstance(tg_data, dict):
+        return None
+    try:
+        return str(tg_data.get("telegram_response", {}).get("result", {}).get("message_id"))
+    except Exception:
+        return None
 
+def infer_market_from_decision(decision: Optional[str]) -> Optional[str]:
+    if not decision:
+        return None
+    d = str(decision).upper()
+    if d.endswith("_HOME") or d.endswith("_DRAW") or d.endswith("_AWAY"):
+        return "1X2"
+    for market in ["BTTS_YES", "BTTS_NO", "OVER_2_5", "UNDER_2_5"]:
+        if market in d:
+            return market
+    return None
 
-def kickoff_similarity(api_date: Optional[str], unix_ts: Optional[Any]) -> float:
-    dt = parse_iso_date(api_date)
-    ts = maybe_float(unix_ts)
-    if not dt or ts is None:
-        return 0.0
-    delta_minutes = abs(dt.timestamp() - ts) / 60.0
-    if delta_minutes <= 5:
-        return 1.0
-    if delta_minutes <= 20:
-        return 0.9
-    if delta_minutes <= 60:
-        return 0.7
-    if delta_minutes <= 180:
-        return 0.45
+def save_signal_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    required = ["signal_uid", "created_at", "build_id", "fixture_id", "decision", "level"]
+    for key in required:
+        if record.get(key) is None:
+            raise ValueError(f"Missing required record field: {key}")
+    try:
+        with closing(db_connect()) as conn:
+            conn.execute("""
+            INSERT OR IGNORE INTO signals (
+                signal_uid, created_at, build_id, fixture_id, match_date, kickoff_utc,
+                league_id, league_name, tier, country, home_team, away_team,
+                market, side, mode, decision, level, level_name,
+                odd, raw_edge, adjusted_edge, prob, hxg, axg, xg_source, dcs, confidence,
+                confluence_count, confidence_count,
+                rationale, contextual_flags, contextual_penalties,
+                telegram_sent, telegram_http_status, telegram_message_id, stake
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """, (
+                record.get("signal_uid"), record.get("created_at"), record.get("build_id"),
+                record.get("fixture_id"), record.get("match_date"), record.get("kickoff_utc"),
+                record.get("league_id"), record.get("league_name"), record.get("tier"),
+                record.get("country"), record.get("home_team"), record.get("away_team"),
+                record.get("market"), record.get("side"), record.get("mode", "BET"),
+                record.get("decision"), record.get("level"), record.get("level_name"),
+                record.get("odd"), record.get("raw_edge"), record.get("adjusted_edge"),
+                record.get("prob"), record.get("hxg"), record.get("axg"),
+                record.get("xg_source"), record.get("dcs"), record.get("confidence"),
+                record.get("confluence_count"), record.get("confidence_count"),
+                record.get("rationale"), record.get("contextual_flags"),
+                record.get("contextual_penalties"),
+                1 if record.get("telegram_sent") else 0,
+                record.get("telegram_http_status"), record.get("telegram_message_id"),
+                record.get("stake", 0.0),
+            ))
+            conn.commit()
+            row = conn.execute("SELECT id FROM signals WHERE signal_uid=?",
+                               (record["signal_uid"],)).fetchone()
+        return {"status": "ok", "signal_uid": record["signal_uid"],
+                "row_id": int(row["id"]) if row else None}
+    except Exception as exc:
+        logger.error("save_signal_record failed: %s", exc)
+        return {"status": "error", "details": str(exc)}
+
+# ============================================================
+# RÉSOLUTION AUTOMATIQUE
+# ============================================================
+FINAL_STATUSES = {"FT", "AET", "PEN"}
+VOID_STATUSES  = {"CANC", "PST", "ABD", "AWD", "WO"}
+
+def compute_bet_outcome(market, side, home_goals, away_goals, match_status) -> str:
+    if match_status in VOID_STATUSES:
+        return "void"
+    if home_goals is None or away_goals is None:
+        return "pending"
+    total = home_goals + away_goals
+    if market == "1X2":
+        if side == "Home":  return "win" if home_goals > away_goals else "loss"
+        if side == "Draw":  return "win" if home_goals == away_goals else "loss"
+        if side == "Away":  return "win" if away_goals > home_goals else "loss"
+        return "loss"
+    if market == "BTTS_YES":  return "win" if home_goals > 0 and away_goals > 0 else "loss"
+    if market == "BTTS_NO":   return "win" if home_goals == 0 or away_goals == 0 else "loss"
+    if market == "OVER_2_5":  return "win" if total >= 3 else "loss"
+    if market == "UNDER_2_5": return "win" if total <= 2 else "loss"
+    return "loss"
+
+def compute_profit(outcome: str, odd: Optional[float], stake: float) -> float:
+    if outcome == "win":
+        if odd is None or odd <= 1:
+            return 0.0
+        return round((odd - 1.0) * stake, 4)
+    if outcome == "loss":
+        return round(-stake, 4)
     return 0.0
 
+def resolve_fixture_signals(fixture_id: int) -> Dict[str, Any]:
+    fixture_data, fixture_status = get_fixture_by_id(str(fixture_id))
+    if fixture_status != 200:
+        return {"status": "error", "fixture_id": fixture_id, "details": fixture_data}
+    match = fixture_data["fixture"]
+    status_short = match.get("fixture", {}).get("status", {}).get("short")
+    home_goals = maybe_int(match.get("goals", {}).get("home"))
+    away_goals = maybe_int(match.get("goals", {}).get("away"))
+    if status_short not in FINAL_STATUSES and status_short not in VOID_STATUSES:
+        return {"status": "pending", "fixture_id": fixture_id, "match_status": status_short}
+    with closing(db_connect()) as conn:
+        rows = conn.execute("SELECT * FROM signals WHERE fixture_id=? AND result_status='pending'",
+                            (fixture_id,)).fetchall()
+        resolved_count = 0
+        for row in rows:
+            outcome = compute_bet_outcome(row["market"], row["side"],
+                                          home_goals, away_goals, status_short)
+            profit = compute_profit(outcome, maybe_float(row["odd"]),
+                                    maybe_float(row["stake"]) or 0.0)
+            conn.execute("""
+                UPDATE signals SET result_status='resolved', match_status=?,
+                    home_goals=?, away_goals=?, bet_outcome=?, profit=?, resolved_at=?
+                WHERE id=?
+            """, (status_short, home_goals, away_goals, outcome, profit,
+                  now_utc().isoformat(), row["id"]))
+            # Mettre à jour la bankroll si mode BET
+            if row["mode"] == "BET" and outcome in ("win", "loss"):
+                current = get_bankroll()
+                set_bankroll(current + profit)
+            resolved_count += 1
+        conn.commit()
+    return {"status": "ok", "fixture_id": fixture_id, "match_status": status_short,
+            "home_goals": home_goals, "away_goals": away_goals, "resolved_count": resolved_count}
 
-def is_priority_fixture(match: Dict[str, Any]) -> bool:
-    text = (
-        (match.get("league", {}).get("name") or "").lower()
-        + " "
-        + (match.get("teams", {}).get("home", {}).get("name") or "").lower()
-        + " "
-        + (match.get("teams", {}).get("away", {}).get("name") or "").lower()
-    )
-    return not any(keyword in text for keyword in EXCLUDED_KEYWORDS)
-
-
-def is_target_league_by_id(match: Dict[str, Any]) -> bool:
-    return match.get("league", {}).get("id") in TARGET_LEAGUE_IDS
-
-
-def is_pre_match_fixture(match: Dict[str, Any]) -> bool:
-    return match.get("fixture", {}).get("status", {}).get("short") == "NS"
-
-
-def is_live_or_not_prematch(status_short: Optional[str]) -> bool:
-    return status_short != "NS"
-
+def resolve_pending_signals(limit: int = RESOLVE_BATCH_LIMIT) -> Dict[str, Any]:
+    with closing(db_connect()) as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT fixture_id FROM signals WHERE result_status='pending'
+            ORDER BY created_at ASC LIMIT ?
+        """, (limit,)).fetchall()
+    fixture_ids = [int(r["fixture_id"]) for r in rows]
+    results = []
+    total_resolved = 0
+    for fid in fixture_ids:
+        try:
+            result = resolve_fixture_signals(fid)
+            results.append(result)
+            if result.get("status") == "ok":
+                total_resolved += int(result.get("resolved_count", 0))
+        except Exception as exc:
+            logger.exception("resolve_fixture_signals failed for fixture_id=%s", fid)
+            results.append({"status": "error", "fixture_id": fid, "details": str(exc)})
+    return {"status": "ok", "checked_fixtures": len(fixture_ids),
+            "resolved_signals": total_resolved, "results": results}
 
 # ============================================================
 # TELEGRAM
 # ============================================================
-def send_telegram_message(text: str) -> Tuple[Dict[str, Any], int]:
-    config = {
-        "bot_token_present": bool(BOT_TOKEN),
-        "chat_id_present": bool(CHAT_ID),
-    }
-
+def send_telegram_message(text: str, parse_mode: str = "HTML") -> Tuple[Dict[str, Any], int]:
+    config = {"bot_token_present": bool(BOT_TOKEN), "chat_id_present": bool(CHAT_ID)}
     if not BOT_TOKEN:
         return {"status": "error", "message": "BOT_TOKEN is missing", "config": config}, 500
     if not CHAT_ID:
         return {"status": "error", "message": "CHAT_ID is missing", "config": config}, 500
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     try:
-        response = HTTP.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": text},
-            timeout=15,
-        )
+        response = HTTP.post(url, json={"chat_id": CHAT_ID, "text": text,
+                                        "parse_mode": parse_mode}, timeout=15)
         data = response.json()
     except Exception as e:
         logger.exception("Telegram request failed")
-        return {
-            "status": "error",
-            "message": "Telegram request failed",
-            "details": str(e),
-            "config": config,
-        }, 500
-
+        return {"status": "error", "message": "Telegram request failed",
+                "details": str(e), "config": config}, 500
     if not response.ok or not data.get("ok"):
-        return {
-            "status": "error",
-            "message": "Telegram API returned an error",
-            "telegram_response": data,
-            "config": config,
-        }, 500
-
+        return {"status": "error", "message": "Telegram API returned an error",
+                "telegram_response": data, "config": config}, 500
     return {"status": "ok", "telegram_response": data, "config": config}, 200
 
+def set_telegram_webhook(url: str) -> Tuple[Dict[str, Any], int]:
+    if not BOT_TOKEN:
+        return {"status": "error", "message": "BOT_TOKEN is missing"}, 500
+    params: Dict[str, Any] = {"url": url}
+    if WEBHOOK_SECRET:
+        params["secret_token"] = WEBHOOK_SECRET
+    try:
+        r = HTTP.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+                      json=params, timeout=15)
+        return {"status": "ok", "telegram_response": r.json()}, 200
+    except Exception as exc:
+        return {"status": "error", "details": str(exc)}, 500
+
+def format_signal_message(signal: Dict[str, Any]) -> str:
+    """Message Telegram HTML — mode BET ou SIGNAL."""
+    mode = signal.get("mode", "BET")
+    icon = "🚀" if mode == "BET" else "📡"
+    tier = signal.get("tier", "")
+    tier_line = f"[{tier}] " if tier else ""
+
+    odds_line = ""
+    if signal.get("odd"):
+        edge_pct = f" ({signal['edge']*100:.1f}% edge)" if signal.get("edge") else ""
+        odds_line = f"@ {signal['odd']:.2f}{edge_pct}"
+    else:
+        odds_line = "(Sans cote — Signal modèle)"
+
+    stake_line = ""
+    if mode == "BET" and signal.get("stake") and signal["stake"] > 0:
+        stake_line = f"\n💰 Mise Kelly: <b>{signal['stake']:.2f}</b>"
+
+    xg_src = signal.get("xg_source", "proxy")
+    src_icon = "📊" if xg_src == "footystats" else "🔢"
+
+    return (
+        f"{icon} <b>APEX-ULTIMATE — {mode}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 {tier_line}{signal.get('league_name', '')}\n"
+        f"⚽ <b>{signal.get('home', '')} vs {signal.get('away', '')}</b>\n"
+        f"⏱ {format_match_time(signal.get('kickoff_utc'))}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Signal: <b>{signal.get('side', '')} {signal.get('decision', '')}</b>\n"
+        f"   {odds_line}\n"
+        f"📈 Prob: {signal.get('prob', 0)*100:.1f}% | Conf: {signal.get('confidence', 0)}/50\n"
+        f"{src_icon} xG: {signal.get('hxg', 0):.2f} - {signal.get('axg', 0):.2f} ({xg_src})\n"
+        f"🔎 DCS: {signal.get('dcs', 0):.2f}"
+        f"{stake_line}"
+    )
 
 # ============================================================
-# API-FOOTBALL
+# API-FOOTBALL — CALLS
 # ============================================================
-def call_api_football(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], int]:
+def call_api_football(endpoint: str, params: Optional[Dict] = None) -> Tuple[Dict, int]:
     if not API_KEY:
         return {"status": "error", "message": "API_KEY is missing"}, 500
-
     headers = {"x-apisports-key": API_KEY}
     url = f"{API_FOOTBALL_BASE_URL}/{endpoint}"
-
     try:
-        response = HTTP.get(
-            url,
-            headers=headers,
-            params=params or {},
-            timeout=REQUEST_TIMEOUT,
-        )
+        response = HTTP.get(url, headers=headers, params=params or {}, timeout=REQUEST_TIMEOUT)
         data = response.json()
     except Exception as e:
-        return {
-            "status": "error",
-            "message": "API-Football request failed",
-            "details": str(e),
-        }, 500
-
+        return {"status": "error", "message": "API-Football request failed", "details": str(e)}, 500
     if not response.ok:
-        return {
-            "status": "error",
-            "message": "API-Football returned an HTTP error",
-            "http_status": response.status_code,
-            "api_response": data,
-        }, 500
-
+        return {"status": "error", "message": "API-Football HTTP error",
+                "http_status": response.status_code, "api_response": data}, 500
     return {"status": "ok", "data": data}, 200
 
-
-def get_fixture_by_id(fixture_id: str) -> Tuple[Dict[str, Any], int]:
-    data, status_code = call_api_football("fixtures", {"id": fixture_id})
-    if status_code != 200:
-        return data, status_code
-
+def get_fixture_by_id(fixture_id: str) -> Tuple[Dict, int]:
+    data, status = call_api_football("fixtures", {"id": fixture_id})
+    if status != 200:
+        return data, status
     response = data["data"].get("response", [])
     if not response:
-        return {"status": "error", "message": f"No fixture found for fixture_id={fixture_id}"}, 404
-
+        return {"status": "error", "message": f"No fixture for fixture_id={fixture_id}"}, 404
     return {"status": "ok", "fixture": response[0]}, 200
 
+def get_fixtures_by_date(date_str: Optional[str] = None) -> Tuple[Dict, int]:
+    return call_api_football("fixtures", {"date": date_str or utc_today_str()})
 
-def get_fixtures_by_date(date_str: Optional[str] = None) -> Tuple[Dict[str, Any], int]:
-    date_str = date_str or utc_today_str()
-    return call_api_football("fixtures", {"date": date_str})
+def get_predictions_api(fixture_id: str) -> Optional[Dict]:
+    data, status = call_api_football("predictions", {"fixture": fixture_id})
+    if status != 200 or not data["data"].get("response"):
+        return None
+    return data["data"]["response"][0]
 
+def get_stats_smart(team_id: int, league_id: int, season: int) -> Optional[Dict]:
+    """Récupère stats équipe. Fallback ligue domestique si UEFA."""
+    data, status = call_api_football("teams/statistics",
+                                     {"team": team_id, "league": league_id, "season": season})
+    if status == 200 and data["data"].get("response"):
+        return data["data"]["response"]
 
-def build_fixture_detail(match: Dict[str, Any]) -> Dict[str, Any]:
+    # Fallback pour UEFA: chercher ligue domestique
+    if league_id in {2, 3, 848, 17}:
+        team_data, t_status = call_api_football("teams", {"id": team_id})
+        if t_status == 200:
+            country = (team_data["data"].get("response") or [{}])[0].get("team", {}).get("country", "")
+            domestic = COUNTRY_TO_LEAGUE.get(country)
+            if domestic:
+                data2, s2 = call_api_football("teams/statistics",
+                                              {"team": team_id, "league": domestic, "season": season})
+                if s2 == 200 and data2["data"].get("response"):
+                    logger.debug("Stats fallback %s → league %s (country %s)", team_id, domestic, country)
+                    return data2["data"]["response"]
+    return None
+
+def get_standings_cached(league_id: int, season: int,
+                          cache: Optional[Dict[Tuple, Any]] = None) -> List[Dict]:
+    key = (league_id, season)
+    if cache is not None and key in cache:
+        return cache[key]
+    data, status = call_api_football("standings", {"league": league_id, "season": season})
+    if status != 200:
+        return []
+    result = data["data"].get("response", [])
+    if cache is not None:
+        cache[key] = result
+    return result
+
+# ============================================================
+# API-FOOTBALL — ODDS
+# ============================================================
+def label_to_side(label: str, home_name: str, away_name: str) -> Optional[str]:
+    normalized = (label or "").strip().lower()
+    home_name = (home_name or "").strip().lower()
+    away_name = (away_name or "").strip().lower()
+    if normalized in {"home", "1"}: return "Home"
+    if normalized in {"draw", "x"}: return "Draw"
+    if normalized in {"away", "2"}: return "Away"
+    if home_name and normalized == home_name: return "Home"
+    if away_name and normalized == away_name: return "Away"
+    return None
+
+def pick_best_1x2_odds(fixture_id: str, home_name: str,
+                        away_name: str) -> Optional[Dict[str, float]]:
+    """Récupère les meilleures cotes 1X2 depuis API-Football."""
+    data, status = call_api_football("odds", {"fixture": fixture_id})
+    if status != 200:
+        return None
+    market_names = {"match winner", "winner", "1x2"}
+    for fixture_odds in data["data"].get("response", []):
+        for bookmaker in fixture_odds.get("bookmakers", []):
+            for bet in bookmaker.get("bets", []):
+                if (bet.get("name") or "").strip().lower() not in market_names:
+                    continue
+                extracted: Dict[str, Optional[float]] = {"Home": None, "Draw": None, "Away": None}
+                for value in bet.get("values", []):
+                    side = label_to_side(value.get("value"), home_name, away_name)
+                    if side:
+                        extracted[side] = maybe_float(value.get("odd"))
+                if all(v is not None for v in extracted.values()):
+                    return extracted  # type: ignore
+    return None
+
+# ============================================================
+# THE ODDS API — FALLBACK COTES
+# ============================================================
+LEAGUE_TO_ODDS_API_SPORT: Dict[int, str] = {
+    39: "soccer_epl", 140: "soccer_spain_la_liga", 78: "soccer_germany_bundesliga",
+    135: "soccer_italy_serie_a", 61: "soccer_france_ligue_one",
+    2: "soccer_uefa_champs_league", 3: "soccer_uefa_europa_league",
+    848: "soccer_uefa_europa_conference_league", 94: "soccer_portugal_primeira_liga",
+    88: "soccer_netherlands_eredivisie", 71: "soccer_brazil_campeonato",
+    128: "soccer_argentina_primera_division",
+}
+
+def call_odds_api(sport_key: str, cache_key: Optional[str] = None) -> Tuple[Dict, int]:
+    if not ODDS_API_KEY:
+        return {"status": "error", "message": "ODDS_API_KEY is missing"}, 500
+    if cache_key:
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return {"status": "ok", "data": cached, "cached": True}, 200
+    params = {"apiKey": ODDS_API_KEY, "regions": "eu", "markets": "h2h",
+              "bookmakers": ODDS_API_BOOKMAKERS, "oddsFormat": "decimal"}
+    url = f"{ODDS_API_BASE_URL}/sports/{sport_key}/odds/"
+    try:
+        response = HTTP.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        data = response.json()
+    except Exception as e:
+        return {"status": "error", "message": "OddsAPI request failed", "details": str(e)}, 500
+    if not response.ok:
+        return {"status": "error", "message": "OddsAPI HTTP error",
+                "http_status": response.status_code}, 500
+    if cache_key:
+        cache_set(cache_key, data)
+    return {"status": "ok", "data": data, "cached": False}, 200
+
+def get_odds_api_1x2(detail: Dict) -> Optional[Dict[str, float]]:
+    league_id = detail.get("league_id")
+    sport_key = LEAGUE_TO_ODDS_API_SPORT.get(league_id)
+    if not sport_key:
+        return None
+    payload, status = call_odds_api(sport_key, cache_key=f"oddsapi:{sport_key}")
+    if status != 200 or not isinstance(payload.get("data"), list):
+        return None
+    best_event = None
+    best_score = 0.0
+    for ev in payload["data"]:
+        h_sim = team_name_similarity(detail.get("home"), ev.get("home_team"))
+        a_sim = team_name_similarity(detail.get("away"), ev.get("away_team"))
+        if h_sim < 0.60 or a_sim < 0.60:
+            continue
+        t_sim = kickoff_similarity(detail.get("date"), ev.get("commence_time"))
+        score = h_sim * 0.42 + a_sim * 0.42 + t_sim * 0.16
+        if score > best_score:
+            best_score = score
+            best_event = ev
+    if not best_event or best_score < 0.72:
+        return None
+    for bm in (best_event.get("bookmakers") or []):
+        for market in (bm.get("markets") or []):
+            if market.get("key") != "h2h":
+                continue
+            home_team = best_event.get("home_team", "")
+            away_team = best_event.get("away_team", "")
+            h = d = a = None
+            for o in (market.get("outcomes") or []):
+                name = o.get("name", "")
+                price = maybe_float(o.get("price"))
+                if name == home_team:         h = price
+                elif name == away_team:       a = price
+                elif name.lower() in {"draw", "x"}: d = price
+            if h is not None and d is not None and a is not None:
+                return {"Home": h, "Draw": d, "Away": a}
+    return None
+
+# ============================================================
+# FOOTYSTATS
+# ============================================================
+def call_footystats(endpoint: str, params: Optional[Dict] = None,
+                    cache_key: Optional[str] = None) -> Tuple[Dict, int]:
+    if not FOOTYSTATS_KEY:
+        return {"status": "error", "message": "FOOTYSTATS_KEY is missing"}, 500
+    if cache_key:
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return {"status": "ok", "data": cached, "cached": True}, 200
+    query = dict(params or {})
+    query["key"] = FOOTYSTATS_KEY
+    url = f"{FOOTYSTATS_BASE_URL}/{endpoint}"
+    try:
+        response = HTTP.get(url, params=query, timeout=REQUEST_TIMEOUT)
+        data = response.json()
+    except Exception as e:
+        return {"status": "error", "message": "FootyStats request failed", "details": str(e)}, 500
+    if not response.ok:
+        return {"status": "error", "message": "FootyStats HTTP error",
+                "http_status": response.status_code}, 500
+    if cache_key:
+        cache_set(cache_key, data)
+    return {"status": "ok", "data": data, "cached": False}, 200
+
+def get_footystats_matches_cached() -> List[Dict]:
+    """Cache FootyStats todays-matches sur 25 min."""
+    global _FS_MATCHES_CACHE, _FS_CACHE_TS
+    now = time.time()
+    if now - _FS_CACHE_TS < _FS_TTL and _FS_MATCHES_CACHE:
+        return _FS_MATCHES_CACHE
+    if not FOOTYSTATS_KEY:
+        return []
+    date_str = utc_today_str()
+    payload, status = call_footystats("todays-matches",
+                                       {"date": date_str, "timezone": "Etc/UTC"},
+                                       cache_key=f"fs:todays:{date_str}")
+    if status == 200:
+        raw = payload["data"]
+        data = raw.get("data") if isinstance(raw, dict) else raw
+        if isinstance(data, list):
+            _FS_MATCHES_CACHE = data
+            _FS_CACHE_TS = now
+            logger.info("FootyStats updated: %d matches", len(data))
+            return data
+    return []
+
+def find_fs_match(home: str, away: str,
+                   fs_matches: List[Dict]) -> Optional[Dict]:
+    best_score = 0.0
+    best = None
+    for m in fs_matches:
+        score = (team_name_similarity(home, m.get("home_name", "")) +
+                 team_name_similarity(away, m.get("away_name", ""))) / 2
+        if score > best_score and score > 0.75:
+            best_score = score
+            best = m
+    return best
+
+def get_fs_match_details(match_id: int) -> Optional[Dict]:
+    payload, status = call_footystats("match", {"match_id": match_id},
+                                       cache_key=f"fs:match:{match_id}")
+    if status != 200:
+        return None
+    raw = payload["data"]
+    detail_data = raw.get("data") if isinstance(raw, dict) else raw
+    if isinstance(detail_data, list) and detail_data:
+        detail_data = detail_data[0]
+    return detail_data if isinstance(detail_data, dict) else None
+
+# ============================================================
+# CALCUL DCS + CONFIANCE
+# ============================================================
+def calculate_dcs(stats_h: Optional[Dict], stats_a: Optional[Dict],
+                  xg_source: str) -> float:
+    """Data Confidence Score: 0.0 → 1.0"""
+    score = 0.0
+    gp_h = 0
+    gp_a = 0
+    if stats_h:
+        gp_h = (stats_h.get("fixtures", {}).get("played", {}).get("total", 0) or 0)
+    if stats_a:
+        gp_a = (stats_a.get("fixtures", {}).get("played", {}).get("total", 0) or 0)
+    min_gp = min(gp_h, gp_a)
+    if min_gp >= 10:   score += 0.4
+    elif min_gp >= 5:  score += 0.2
+    if xg_source == "footystats": score += 0.6
+    elif xg_source == "proxy":    score += 0.2
+    return min(score, 1.0)
+
+def calculate_confidence(prob: float, edge: float, dcs: float, tier: str) -> int:
+    """Score de confiance /50."""
+    score = 0
+    if edge >= 0.10:   score += 15
+    elif edge >= 0.07: score += 10
+    elif edge >= 0.04: score += 5
+    tier_bonus = {"P0": 15, "N1": 10, "N2": 5, "N3": 2}.get(tier, 0)
+    score += tier_bonus
+    if dcs >= 0.80:    score += 15
+    elif dcs >= 0.60:  score += 10
+    elif dcs >= 0.40:  score += 5
+    if prob >= 0.65:   score += 5
+    elif prob >= 0.55: score += 2
+    return min(score, 50)
+
+# ============================================================
+# MOTEUR D'ANALYSE PRINCIPAL — DIXON-COLES HYBRIDE
+# ============================================================
+def build_fixture_detail(match: Dict) -> Dict:
     fixture = match.get("fixture", {})
     league = match.get("league", {})
     teams = match.get("teams", {})
@@ -479,1659 +1068,297 @@ def build_fixture_detail(match: Dict[str, Any]) -> Dict[str, Any]:
         "away_team_id": teams.get("away", {}).get("id"),
     }
 
+def is_pre_match_fixture(match: Dict) -> bool:
+    return match.get("fixture", {}).get("status", {}).get("short") == "NS"
 
-def find_team_standing(standings_response: List[Dict[str, Any]], team_id: Optional[int]) -> Optional[Dict[str, Any]]:
-    if team_id is None:
-        return None
+def is_priority_fixture(match: Dict) -> bool:
+    text = (
+        (match.get("league", {}).get("name") or "").lower() + " " +
+        (match.get("teams", {}).get("home", {}).get("name") or "").lower() + " " +
+        (match.get("teams", {}).get("away", {}).get("name") or "").lower()
+    )
+    return not any(kw in text for kw in EXCLUDED_KEYWORDS)
 
-    for league_block in standings_response:
-        league = league_block.get("league", {})
-        for standing_group in league.get("standings", []):
-            for team_row in standing_group:
-                if team_row.get("team", {}).get("id") == team_id:
-                    return {
-                        "rank": team_row.get("rank"),
-                        "team_id": team_row.get("team", {}).get("id"),
-                        "team_name": team_row.get("team", {}).get("name"),
-                        "points": team_row.get("points"),
-                        "form": team_row.get("form"),
-                        "played": team_row.get("all", {}).get("played"),
-                        "win": team_row.get("all", {}).get("win"),
-                        "draw": team_row.get("all", {}).get("draw"),
-                        "lose": team_row.get("all", {}).get("lose"),
-                        "goals_for": team_row.get("all", {}).get("goals", {}).get("for"),
-                        "goals_against": team_row.get("all", {}).get("goals", {}).get("against"),
-                    }
-    return None
+def analyse_fixture_core(fixture_id: str,
+                          preloaded_fs_matches: Optional[List[Dict]] = None,
+                          standings_cache: Optional[Dict[Tuple, Any]] = None,
+                          ) -> Tuple[Optional[Dict], int]:
+    """
+    Analyse complète d'un fixture.
+    Retourne (signal_dict, http_status) ou (None, 200) si NO_BET.
+    """
+    fixture_data, fixture_status = get_fixture_by_id(fixture_id)
+    if fixture_status != 200:
+        return fixture_data, fixture_status
 
+    match = fixture_data["fixture"]
+    detail = build_fixture_detail(match)
 
-def get_api_context(detail: Dict[str, Any], standings_cache: Optional[Dict[Tuple, Any]] = None) -> Tuple[Dict[str, Any], int]:
+    # Gate 0 — match pas encore commencé
+    if detail["status_short"] != "NS":
+        return None, 200
+
     league_id = detail["league_id"]
+    cfg = LEAGUE_CONFIG.get(league_id)
+    if not cfg:
+        return None, 200  # Ligue non configurée
+
+    tier = cfg["tier"]
     season = detail["season"]
-    cache_key = (league_id, season)
+    home_id = detail["home_team_id"]
+    away_id = detail["away_team_id"]
 
-    # Vérification du cache intra-scan
-    if standings_cache is not None and cache_key in standings_cache:
-        standings_response = standings_cache[cache_key]
-    else:
-        standings_data, standings_status = call_api_football(
-            "standings",
-            {"league": league_id, "season": season},
-        )
-        if standings_status != 200:
-            return standings_data, standings_status
-        standings_response = standings_data["data"].get("response", [])
-        if standings_cache is not None:
-            standings_cache[cache_key] = standings_response
-    home_standing = find_team_standing(standings_response, detail["home_team_id"])
-    away_standing = find_team_standing(standings_response, detail["away_team_id"])
+    # ---- 1. Statistiques équipes ----
+    stats_h = get_stats_smart(home_id, league_id, season)
+    stats_a = get_stats_smart(away_id, league_id, season)
 
-    context = {
-        "home_rank": home_standing["rank"] if home_standing else None,
-        "away_rank": away_standing["rank"] if away_standing else None,
-        "home_points": home_standing["points"] if home_standing else None,
-        "away_points": away_standing["points"] if away_standing else None,
-        "home_form": home_standing["form"] if home_standing else None,
-        "away_form": away_standing["form"] if away_standing else None,
-        "home_goals_for": home_standing["goals_for"] if home_standing else None,
-        "home_goals_against": home_standing["goals_against"] if home_standing else None,
-        "away_goals_for": away_standing["goals_for"] if away_standing else None,
-        "away_goals_against": away_standing["goals_against"] if away_standing else None,
-        "home_played": home_standing["played"] if home_standing else None,
-        "away_played": away_standing["played"] if away_standing else None,
-    }
-    return {"status": "ok", "context": context}, 200
+    # ---- 2. xG source ----
+    hxg = axg = 1.0
+    xg_source = "proxy"
+    fs_match_data = None
 
+    fs_matches = preloaded_fs_matches or get_footystats_matches_cached()
+    fs_raw = find_fs_match(detail["home"], detail["away"], fs_matches)
 
-def label_to_side(label: str, home_name: Optional[str], away_name: Optional[str]) -> Optional[str]:
-    normalized = (label or "").strip().lower()
-    home_name = (home_name or "").strip().lower()
-    away_name = (away_name or "").strip().lower()
+    if fs_raw:
+        match_id = maybe_int(fs_raw.get("id"))
+        if match_id:
+            fs_match_data = get_fs_match_details(match_id) or fs_raw
+        else:
+            fs_match_data = fs_raw
+        _hxg = maybe_float(fs_match_data.get("team_a_xg_prematch") or
+                            fs_match_data.get("team_a_xg_avg"))
+        _axg = maybe_float(fs_match_data.get("team_b_xg_prematch") or
+                            fs_match_data.get("team_b_xg_avg"))
+        if _hxg and _axg:
+            hxg = _hxg
+            axg = _axg
+            xg_source = "footystats"
 
-    if normalized in {"home", "1"}:
-        return "Home"
-    if normalized in {"draw", "x"}:
-        return "Draw"
-    if normalized in {"away", "2"}:
-        return "Away"
-    if home_name and normalized == home_name:
-        return "Home"
-    if away_name and normalized == away_name:
-        return "Away"
-    return None
+    # Fallback proxy via goals/jeux si FootyStats indispo
+    if xg_source == "proxy" and stats_h and stats_a:
+        h_for    = (stats_h.get("goals", {}).get("for", {}).get("total", {}).get("total") or 0)
+        h_played = (stats_h.get("fixtures", {}).get("played", {}).get("total") or 1)
+        a_for    = (stats_a.get("goals", {}).get("for", {}).get("total", {}).get("total") or 0)
+        a_played = (stats_a.get("fixtures", {}).get("played", {}).get("total") or 1)
+        hxg = max((h_for / h_played), 0.5) if h_played > 0 else 1.0
+        axg = max((a_for / a_played), 0.5) if a_played > 0 else 1.0
+        # Applique l'avantage domicile
+        hxg *= cfg.get("home_adv", 1.10)
 
+    # ---- 3. Probabilités Dixon-Coles ----
+    dc_probs = calculate_probs_dc(hxg, axg, league_id)
 
-def pick_best_1x2_market(odds_response: List[Dict[str, Any]], home_name: Optional[str], away_name: Optional[str]) -> Dict[str, Any]:
-    market_names = {"match winner", "winner", "1x2"}
-    for fixture_odds in odds_response:
-        for bookmaker in fixture_odds.get("bookmakers", []):
-            for bet in bookmaker.get("bets", []):
-                bet_name = (bet.get("name") or "").strip().lower()
-                if bet_name not in market_names:
-                    continue
-                extracted = {"Home": None, "Draw": None, "Away": None}
-                for value in bet.get("values", []):
-                    side = label_to_side(value.get("value"), home_name, away_name)
-                    if side:
-                        extracted[side] = value.get("odd")
-                if all(v is not None for v in extracted.values()):
-                    return {
-                        "bookmaker_name": bookmaker.get("name"),
-                        "bet_name": bet.get("name"),
-                        "odds_1x2": extracted,
-                    }
-    return {"bookmaker_name": None, "bet_name": None, "odds_1x2": None}
+    # ---- 4. DCS ----
+    dcs = calculate_dcs(stats_h, stats_a, xg_source)
 
+    # ---- 5. Récupération cotes (pipeline 3 niveaux) ----
+    odds_1x2: Optional[Dict[str, float]] = None
+    odds_source = None
 
-def find_market_values_any_bookmaker(
-    odds_response: List[Dict[str, Any]],
-    market_names: List[str],
-    accepted_labels: Optional[List[str]] = None,
-) -> Optional[Dict[str, Any]]:
-    target_names = {m.lower() for m in market_names}
-    for fixture_odds in odds_response:
-        for bookmaker in fixture_odds.get("bookmakers", []):
-            for bet in bookmaker.get("bets", []):
-                bet_name = (bet.get("name") or "").lower()
-                if bet_name not in target_names:
-                    continue
-                extracted = {}
-                for item in bet.get("values", []):
-                    label = item.get("value")
-                    odd = item.get("odd")
-                    if accepted_labels is None or label in accepted_labels:
-                        extracted[label] = odd
-                if extracted:
-                    return {
-                        "bookmaker_name": bookmaker.get("name"),
-                        "bet_name": bet.get("name"),
-                        "values": extracted,
-                    }
-    return None
+    # Niveau 1 — API-Football
+    odds_1x2 = pick_best_1x2_odds(fixture_id, detail["home"], detail["away"])
+    if odds_1x2:
+        odds_source = "api_football"
 
+    # Niveau 2 — FootyStats odds
+    if not odds_1x2 and fs_match_data:
+        h_odd = maybe_float(fs_match_data.get("odds_ft_1"))
+        d_odd = maybe_float(fs_match_data.get("odds_ft_x"))
+        a_odd = maybe_float(fs_match_data.get("odds_ft_2"))
+        if h_odd and d_odd and a_odd:
+            odds_1x2 = {"Home": h_odd, "Draw": d_odd, "Away": a_odd}
+            odds_source = "footystats"
 
-# ============================================================
-# FOOTYSTATS
-# ============================================================
-def call_footystats(endpoint: str, params: Optional[Dict[str, Any]] = None, cache_key: Optional[str] = None) -> Tuple[Dict[str, Any], int]:
-    if not FOOTYSTATS_KEY:
-        return {"status": "error", "message": "FOOTYSTATS_KEY is missing"}, 500
+    # Niveau 3 — The Odds API
+    if not odds_1x2:
+        odds_1x2 = get_odds_api_1x2(detail)
+        if odds_1x2:
+            odds_source = "odds_api"
 
-    if cache_key:
-        cached = cache_get(cache_key)
-        if cached is not None:
-            return {"status": "ok", "data": cached, "cached": True}, 200
+    # ---- 6. MODE BET (cotes disponibles) ----
+    best_signal: Optional[Dict] = None
 
-    query = dict(params or {})
-    query["key"] = FOOTYSTATS_KEY
-    url = f"{FOOTYSTATS_BASE_URL}/{endpoint}"
-
-    try:
-        response = HTTP.get(url, params=query, timeout=REQUEST_TIMEOUT)
-        data = response.json()
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": "FootyStats request failed",
-            "details": str(e),
-        }, 500
-
-    if not response.ok:
-        return {
-            "status": "error",
-            "message": "FootyStats returned an HTTP error",
-            "http_status": response.status_code,
-            "api_response": data,
-        }, 500
-
-    if cache_key:
-        cache_set(cache_key, data)
-
-    return {"status": "ok", "data": data, "cached": False}, 200
-
-
-def footystats_data_as_list(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    data = payload.get("data")
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        if isinstance(data.get("matches"), list):
-            return data["matches"]
-        if isinstance(data.get("data"), list):
-            return data["data"]
-        return [data]
-    return []
-
-
-def get_footystats_matches_by_date(date_str: str) -> Tuple[Dict[str, Any], int]:
-    cache_key = f"footystats:todays_matches:{date_str}"
-    return call_footystats(
-        "todays-matches",
-        {"date": date_str, "timezone": "Etc/UTC"},
-        cache_key=cache_key,
-    )
-
-
-def get_footystats_match_details(match_id: int) -> Tuple[Dict[str, Any], int]:
-    cache_key = f"footystats:match:{match_id}"
-    return call_footystats("match", {"match_id": match_id}, cache_key=cache_key)
-
-
-def map_api_fixture_to_footystats(detail: Dict[str, Any], footy_matches: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    best: Optional[Dict[str, Any]] = None
-    best_score = 0.0
-
-    for item in footy_matches:
-        home_score = team_name_similarity(detail["home"], item.get("home_name"))
-        away_score = team_name_similarity(detail["away"], item.get("away_name"))
-        time_score = kickoff_similarity(detail["date"], item.get("date_unix"))
-
-        # hard rejection on obviously wrong team names
-        if home_score < 0.60 or away_score < 0.60:
-            continue
-
-        score = home_score * 0.42 + away_score * 0.42 + time_score * 0.16
-        if score > best_score:
-            best = item
-            best_score = score
-
-    if best is None or best_score < 0.72:
-        return None
-
-    matched = dict(best)
-    matched["_mapping_score"] = round(best_score, 4)
-    return matched
-
-
-def get_footystats_for_fixture(detail: Dict[str, Any], preloaded_matches: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    date_str = parse_iso_date(detail["date"]).strftime("%Y-%m-%d") if parse_iso_date(detail["date"]) else utc_today_str()
-
-    matches_payload = None
-    if preloaded_matches is None:
-        matches_payload, matches_status = get_footystats_matches_by_date(date_str)
-        if matches_status != 200:
-            return {
-                "enabled": bool(FOOTYSTATS_KEY),
-                "match_found": False,
-                "error": matches_payload,
-            }
-        preloaded_matches = footystats_data_as_list(matches_payload["data"])
-
-    mapped = map_api_fixture_to_footystats(detail, preloaded_matches or [])
-    if not mapped:
-        return {
-            "enabled": bool(FOOTYSTATS_KEY),
-            "match_found": False,
-            "date": date_str,
-            "candidate_count": len(preloaded_matches or []),
-        }
-
-    detail_payload, detail_status = get_footystats_match_details(maybe_int(mapped.get("id")) or 0)
-    if detail_status != 200:
-        return {
-            "enabled": bool(FOOTYSTATS_KEY),
-            "match_found": True,
-            "match_id": mapped.get("id"),
-            "mapping_score": mapped.get("_mapping_score"),
-            "summary": mapped,
-            "error": detail_payload,
-        }
-
-    detail_data = detail_payload["data"].get("data") if isinstance(detail_payload["data"], dict) else detail_payload["data"]
-    if isinstance(detail_data, list) and detail_data:
-        detail_data = detail_data[0]
-
-    return {
-        "enabled": bool(FOOTYSTATS_KEY),
-        "match_found": True,
-        "match_id": mapped.get("id"),
-        "mapping_score": mapped.get("_mapping_score"),
-        "summary": mapped,
-        "match": detail_data if isinstance(detail_data, dict) else mapped,
-    }
-
-
-def build_footystats_features(footy_payload: Dict[str, Any]) -> Dict[str, Any]:
-    match = footy_payload.get("match") if footy_payload.get("match_found") else None
-    if not isinstance(match, dict):
-        return {
-            "enabled": bool(FOOTYSTATS_KEY),
-            "match_found": False,
-        }
-
-    features = {
-        "match_id": maybe_int(match.get("id")),
-        "mapping_score": footy_payload.get("mapping_score"),
-        "home_name": match.get("home_name"),
-        "away_name": match.get("away_name"),
-        "home_ppg": maybe_float(match.get("home_ppg")),
-        "away_ppg": maybe_float(match.get("away_ppg")),
-        "pre_match_home_ppg": maybe_float(match.get("pre_match_home_ppg")),
-        "pre_match_away_ppg": maybe_float(match.get("pre_match_away_ppg")),
-        "team_a_xg_prematch": maybe_float(match.get("team_a_xg_prematch")),
-        "team_b_xg_prematch": maybe_float(match.get("team_b_xg_prematch")),
-        "total_xg_prematch": maybe_float(match.get("total_xg_prematch")),
-        "btts_potential": maybe_float(match.get("btts_potential")),
-        "o25_potential": maybe_float(match.get("o25_potential")),
-        "u25_potential": maybe_float(match.get("u25_potential")),
-        "avg_potential": maybe_float(match.get("avg_potential")),
-        "home_adv_ppg": maybe_float(match.get("pre_match_home_ppg")),
-        "away_adv_ppg": maybe_float(match.get("pre_match_away_ppg")),
-        "odds_ft_1": maybe_float(match.get("odds_ft_1")),
-        "odds_ft_x": maybe_float(match.get("odds_ft_x")),
-        "odds_ft_2": maybe_float(match.get("odds_ft_2")),
-        "odds_btts_yes": maybe_float(match.get("odds_btts_yes")),
-        "odds_btts_no": maybe_float(match.get("odds_btts_no")),
-        "odds_ft_over25": maybe_float(match.get("odds_ft_over25")),
-        "odds_ft_under25": maybe_float(match.get("odds_ft_under25")),
-        "no_home_away": maybe_int(match.get("no_home_away")),
-        "competition_id": maybe_int(match.get("competition_id")),
-    }
-    features["match_found"] = True
-    features["enabled"] = True
-    return features
-
-
-def build_fs_odds_1x2(fs: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    if not fs.get("match_found"):
-        return None
-    odds = {
-        "Home": fs.get("odds_ft_1"),
-        "Draw": fs.get("odds_ft_x"),
-        "Away": fs.get("odds_ft_2"),
-    }
-    return odds if all(v is not None for v in odds.values()) else None
-
-
-# ============================================================
-# ODDS-API (The Odds API v4) — secondary odds source
-# ============================================================
-
-# Maps API-Football league_id → The Odds API sport key
-LEAGUE_TO_ODDS_API_SPORT: Dict[int, str] = {
-    39: "soccer_epl",
-    40: "soccer_england_league1",
-    41: "soccer_england_league2",
-    140: "soccer_spain_la_liga",
-    141: "soccer_spain_segunda_division",
-    78: "soccer_germany_bundesliga",
-    79: "soccer_germany_bundesliga2",
-    135: "soccer_italy_serie_a",
-    136: "soccer_italy_serie_b",
-    61: "soccer_france_ligue_one",
-    62: "soccer_france_ligue_two",
-    2: "soccer_uefa_champs_league",
-    3: "soccer_uefa_europa_league",
-    848: "soccer_uefa_europa_conference_league",
-    94: "soccer_portugal_primeira_liga",
-    88: "soccer_netherlands_eredivisie",
-    71: "soccer_brazil_campeonato",
-    128: "soccer_argentina_primera_division",
-}
-
-
-def call_odds_api(sport_key: str, cache_key: Optional[str] = None) -> Tuple[Dict[str, Any], int]:
-    """Fetch live/upcoming odds from The Odds API v4 for a given sport key."""
-    if not ODDS_API_KEY:
-        return {"status": "error", "message": "ODDS_API_KEY is missing"}, 500
-
-    if cache_key:
-        cached = cache_get(cache_key)
-        if cached is not None:
-            return {"status": "ok", "data": cached, "cached": True}, 200
-
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "eu",
-        "markets": "h2h",
-        "bookmakers": ODDS_API_BOOKMAKERS,
-        "oddsFormat": "decimal",
-    }
-    url = f"{ODDS_API_BASE_URL}/sports/{sport_key}/odds/"
-
-    try:
-        response = HTTP.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        data = response.json()
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": "OddsAPI request failed",
-            "details": str(e),
-        }, 500
-
-    if not response.ok:
-        return {
-            "status": "error",
-            "message": "OddsAPI returned an HTTP error",
-            "http_status": response.status_code,
-            "api_response": data,
-        }, 500
-
-    if cache_key:
-        cache_set(cache_key, data)
-
-    return {"status": "ok", "data": data, "cached": False}, 200
-
-
-def _extract_odds_api_h2h(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Extract 1X2 odds from a single Odds API event object."""
-    bookmakers_raw = event.get("bookmakers") or []
-    for bm in bookmakers_raw:
-        for market in (bm.get("markets") or []):
-            if market.get("key") != "h2h":
+    if odds_1x2:
+        side_map = {"Home": "H", "Draw": "D", "Away": "A"}
+        for side in ["Home", "Away", "Draw"]:
+            odd = odds_1x2.get(side)
+            if not odd:
                 continue
-            outcomes = market.get("outcomes") or []
-            home_team = event.get("home_team", "")
-            away_team = event.get("away_team", "")
-            h = d = a = None
-            for o in outcomes:
-                name = o.get("name", "")
-                price = maybe_float(o.get("price"))
-                if name == home_team:
-                    h = price
-                elif name == away_team:
-                    a = price
-                elif name.lower() in {"draw", "x"}:
-                    d = price
-            if h is not None and d is not None and a is not None:
-                return {
-                    "bookmaker_name": bm.get("title"),
-                    "odds_1x2": {"Home": h, "Draw": d, "Away": a},
-                    "source": "odds_api",
-                }
-    return None
-
-
-def get_odds_api_1x2(detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Try to find 1X2 odds for a fixture via The Odds API, matched by team name + time."""
-    if not ODDS_API_KEY:
-        return None
-
-    league_id = detail.get("league_id")
-    sport_key = LEAGUE_TO_ODDS_API_SPORT.get(league_id)  # type: ignore[arg-type]
-    if not sport_key:
-        return None  # league not mapped — skip silently
-
-    cache_key = f"oddsapi:{sport_key}"
-    payload, status = call_odds_api(sport_key, cache_key=cache_key)
-    if status != 200 or not isinstance(payload.get("data"), list):
-        return None
-
-    events: List[Dict[str, Any]] = payload["data"]
-    best_event: Optional[Dict[str, Any]] = None
-    best_score = 0.0
-
-    for ev in events:
-        h_sim = team_name_similarity(detail.get("home"), ev.get("home_team"))
-        a_sim = team_name_similarity(detail.get("away"), ev.get("away_team"))
-        if h_sim < 0.60 or a_sim < 0.60:
-            continue
-        t_sim = kickoff_similarity(detail.get("date"), ev.get("commence_time"))
-        score = h_sim * 0.42 + a_sim * 0.42 + t_sim * 0.16
-        if score > best_score:
-            best_score = score
-            best_event = ev
-
-    if best_event is None or best_score < 0.72:
-        return None
-
-    return _extract_odds_api_h2h(best_event)
-
-
-# ============================================================
-# ============================================================
-def build_api_football_model(context: Dict[str, Any]) -> Dict[str, Any]:
-    home_score = 1.0
-    draw_score = 0.8
-    away_score = 1.0
-
-    home_rank = context.get("home_rank")
-    away_rank = context.get("away_rank")
-    home_points = context.get("home_points")
-    away_points = context.get("away_points")
-    home_form = context.get("home_form") or ""
-    away_form = context.get("away_form") or ""
-    home_goals_for = context.get("home_goals_for")
-    away_goals_for = context.get("away_goals_for")
-    home_goals_against = context.get("home_goals_against")
-    away_goals_against = context.get("away_goals_against")
-
-    if home_rank is not None and away_rank is not None:
-        rank_gap = away_rank - home_rank
-        if rank_gap >= 4:
-            home_score += 0.45
-        elif rank_gap >= 2:
-            home_score += 0.25
-        elif rank_gap <= -4:
-            away_score += 0.45
-        elif rank_gap <= -2:
-            away_score += 0.25
-        else:
-            draw_score += 0.20
-
-    if home_points is not None and away_points is not None:
-        point_gap = home_points - away_points
-        if point_gap >= 8:
-            home_score += 0.35
-        elif point_gap >= 3:
-            home_score += 0.20
-        elif point_gap <= -8:
-            away_score += 0.35
-        elif point_gap <= -3:
-            away_score += 0.20
-        else:
-            draw_score += 0.10
-
-    home_wins = count_wins(home_form)
-    away_wins = count_wins(away_form)
-    if home_wins >= away_wins + 2:
-        home_score += 0.30
-    elif away_wins >= home_wins + 2:
-        away_score += 0.30
-    else:
-        draw_score += 0.10
-
-    if home_goals_for is not None and away_goals_for is not None:
-        if home_goals_for >= away_goals_for + 8:
-            home_score += 0.20
-        elif away_goals_for >= home_goals_for + 8:
-            away_score += 0.20
-
-    if home_goals_against is not None and away_goals_against is not None:
-        if away_goals_against >= home_goals_against + 8:
-            home_score += 0.20
-        elif home_goals_against >= away_goals_against + 8:
-            away_score += 0.20
-
-    raw = {"Home": home_score, "Draw": draw_score, "Away": away_score}
-    total = sum(raw.values())
-    probs = {k: v / total for k, v in raw.items()}
-    return {"raw_scores": raw, "probabilities": probs}
-
-
-def build_footystats_model(fs: Dict[str, Any]) -> Dict[str, Any]:
-    if not fs.get("match_found"):
-        return {"raw_scores": {}, "probabilities": {"Home": None, "Draw": None, "Away": None}}
-
-    home_ppg = fs.get("pre_match_home_ppg") or fs.get("home_ppg")
-    away_ppg = fs.get("pre_match_away_ppg") or fs.get("away_ppg")
-    home_xg = fs.get("team_a_xg_prematch")
-    away_xg = fs.get("team_b_xg_prematch")
-    no_home_away = fs.get("no_home_away") == 1
-
-    home_score = 1.0
-    draw_score = 0.82
-    away_score = 1.0
-
-    ppg_gap = (home_ppg or 0.0) - (away_ppg or 0.0)
-    xg_gap = (home_xg or 0.0) - (away_xg or 0.0)
-
-    if not no_home_away:
-        home_score += 0.18
-
-    if ppg_gap >= 0.8:
-        home_score += 0.45
-    elif ppg_gap >= 0.35:
-        home_score += 0.22
-    elif ppg_gap <= -0.8:
-        away_score += 0.45
-    elif ppg_gap <= -0.35:
-        away_score += 0.22
-    else:
-        draw_score += 0.12
-
-    if xg_gap >= 0.55:
-        home_score += 0.30
-    elif xg_gap >= 0.20:
-        home_score += 0.15
-    elif xg_gap <= -0.55:
-        away_score += 0.30
-    elif xg_gap <= -0.20:
-        away_score += 0.15
-    else:
-        draw_score += 0.08
-
-    if abs(ppg_gap) <= 0.15:
-        draw_score += 0.10
-    if abs(xg_gap) <= 0.10:
-        draw_score += 0.08
-
-    raw = {"Home": home_score, "Draw": draw_score, "Away": away_score}
-    total = sum(raw.values())
-    probs = {k: v / total for k, v in raw.items()}
-    return {"raw_scores": raw, "probabilities": probs}
-
-
-def build_confluence_flags(api_context: Dict[str, Any], fs: Dict[str, Any], side: str) -> Dict[str, bool]:
-    flags = {
-        "api_rank_advantage": False,
-        "api_points_advantage": False,
-        "api_form_advantage": False,
-        "fs_ppg_advantage": False,
-        "fs_xg_advantage": False,
-        "fs_mapping_quality": bool(fs.get("mapping_score", 0) >= 0.80),
-    }
-
-    home_rank = api_context.get("home_rank")
-    away_rank = api_context.get("away_rank")
-    home_points = api_context.get("home_points")
-    away_points = api_context.get("away_points")
-    home_form = api_context.get("home_form") or ""
-    away_form = api_context.get("away_form") or ""
-
-    pre_home_ppg = fs.get("pre_match_home_ppg") or fs.get("home_ppg")
-    pre_away_ppg = fs.get("pre_match_away_ppg") or fs.get("away_ppg")
-    home_xg = fs.get("team_a_xg_prematch")
-    away_xg = fs.get("team_b_xg_prematch")
-
-    if side == "Home":
-        if home_rank is not None and away_rank is not None and home_rank < away_rank:
-            flags["api_rank_advantage"] = True
-        if home_points is not None and away_points is not None and home_points > away_points:
-            flags["api_points_advantage"] = True
-        if count_wins(home_form) > count_wins(away_form):
-            flags["api_form_advantage"] = True
-        if pre_home_ppg is not None and pre_away_ppg is not None and pre_home_ppg > pre_away_ppg:
-            flags["fs_ppg_advantage"] = True
-        if home_xg is not None and away_xg is not None and home_xg > away_xg:
-            flags["fs_xg_advantage"] = True
-
-    elif side == "Away":
-        if home_rank is not None and away_rank is not None and away_rank < home_rank:
-            flags["api_rank_advantage"] = True
-        if home_points is not None and away_points is not None and away_points > home_points:
-            flags["api_points_advantage"] = True
-        if count_wins(away_form) > count_wins(home_form):
-            flags["api_form_advantage"] = True
-        if pre_home_ppg is not None and pre_away_ppg is not None and pre_away_ppg > pre_home_ppg:
-            flags["fs_ppg_advantage"] = True
-        if home_xg is not None and away_xg is not None and away_xg > home_xg:
-            flags["fs_xg_advantage"] = True
-
-    else:
-        if home_rank is not None and away_rank is not None and abs(home_rank - away_rank) <= 2:
-            flags["api_rank_advantage"] = True
-        if home_points is not None and away_points is not None and abs(home_points - away_points) <= 3:
-            flags["api_points_advantage"] = True
-        if abs(count_wins(home_form) - count_wins(away_form)) <= 1:
-            flags["api_form_advantage"] = True
-        if pre_home_ppg is not None and pre_away_ppg is not None and abs(pre_home_ppg - pre_away_ppg) <= 0.18:
-            flags["fs_ppg_advantage"] = True
-        if home_xg is not None and away_xg is not None and abs(home_xg - away_xg) <= 0.15:
-            flags["fs_xg_advantage"] = True
-
-    return flags
-
-
-def filtered_edges_by_issue(odds_1x2: Dict[str, Any], edges: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
-    filtered = dict(edges)
-
-    home_odd = maybe_float(odds_1x2.get("Home"))
-    draw_odd = maybe_float(odds_1x2.get("Draw"))
-    away_odd = maybe_float(odds_1x2.get("Away"))
-
-    if home_odd is not None and home_odd < MIN_ODD_HOME_AWAY:
-        filtered["Home"] = None
-    if away_odd is not None and away_odd < MIN_ODD_HOME_AWAY:
-        filtered["Away"] = None
-    if draw_odd is not None and draw_odd < MIN_ODD_DRAW:
-        filtered["Draw"] = None
-
-    return filtered
-
-
-def is_glamour_team(name: Optional[str]) -> bool:
-    normalized = normalize_name(name)
-    return normalized in {normalize_name(x) for x in GLAMOUR_NAMES}
-
-
-def apply_contextual_penalties(
-    detail: Dict[str, Any],
-    fs: Dict[str, Any],
-    side: str,
-    raw_edge: float,
-    selected_odd: Optional[float],
-    confluence_count: int,
-) -> Dict[str, Any]:
-    penalties: List[Dict[str, Any]] = []
-    flags: Dict[str, bool] = {}
-    adjusted_edge = raw_edge
-    level_cap = 3
-
-    elite_match = detail["league_id"] in ELITE_LEAGUE_IDS
-    flags["elite_match"] = elite_match
-    if elite_match:
-        adjusted_edge -= 0.02
-        penalties.append({"reason": "elite_competition", "edge_penalty": 0.02})
-
-    glamour_outsider = (
-        elite_match
-        and side in {"Away", "Home"}
-        and selected_odd is not None
-        and selected_odd >= 3.40
-        and is_glamour_team(detail["away"] if side == "Away" else detail["home"])
-    )
-    flags["glamour_outsider"] = glamour_outsider
-    if glamour_outsider:
-        adjusted_edge -= 0.03
-        penalties.append({"reason": "glamour_outsider", "edge_penalty": 0.03})
-        level_cap = min(level_cap, 2)
-
-    weak_mapping = fs.get("match_found") and (fs.get("mapping_score") or 0) < 0.78
-    flags["weak_footystats_mapping"] = bool(weak_mapping)
-    if weak_mapping:
-        adjusted_edge -= 0.01
-        penalties.append({"reason": "weak_footystats_mapping", "edge_penalty": 0.01})
-
-    if elite_match and confluence_count < 4:
-        level_cap = min(level_cap, 2)
-        penalties.append({"reason": "elite_requires_4_confluence", "level_cap": 2})
-
-    if selected_odd is not None and selected_odd > MAX_ODD_MAIN_SIGNAL:
-        level_cap = min(level_cap, 2)
-        penalties.append({"reason": "odd_too_high_for_main", "level_cap": 2})
-
-    return {
-        "adjusted_edge": adjusted_edge,
-        "flags": flags,
-        "penalties": penalties,
-        "level_cap": level_cap,
-    }
-
-
-def decide_value_signal(
-    detail: Dict[str, Any],
-    odds_1x2: Dict[str, Any],
-    api_context: Dict[str, Any],
-    api_probs: Dict[str, Optional[float]],
-    fs_probs: Dict[str, Optional[float]],
-    hybrid_probs: Dict[str, Optional[float]],
-    fs: Dict[str, Any],
-) -> Dict[str, Any]:
-    market_raw = {
-        "Home": implied_probability(odds_1x2["Home"]),
-        "Draw": implied_probability(odds_1x2["Draw"]),
-        "Away": implied_probability(odds_1x2["Away"]),
-    }
-    market_probs = normalize_probabilities(market_raw)
-    raw_edges = compute_edges(hybrid_probs, market_probs)
-    allowed_edges = filtered_edges_by_issue(odds_1x2, raw_edges)
-    candidates = {k: v for k, v in allowed_edges.items() if v is not None}
-
-    if not candidates:
-        return {
-            "decision": "NO_BET",
-            "side": None,
-            "level": 0,
-            "level_name": None,
-            "rationale": ["Aucune issue autorisée après filtres de cotes minimales."],
-            "market_implied_raw": market_raw,
-            "market_implied_normalized": market_probs,
-            "edges": raw_edges,
-            "allowed_edges": allowed_edges,
-            "best_edge_label": None,
-            "raw_best_edge_value": None,
-            "best_edge_value": None,
-            "confluence_flags": {},
-            "confluence_count": 0,
-            "contextual_flags": {},
-            "contextual_penalties": [],
-        }
-
-    best_side = max(candidates, key=candidates.get)
-    raw_best_edge_value = candidates[best_side]
-    confluence_flags = build_confluence_flags(api_context, fs, best_side)
-    confluence_count = sum(1 for v in confluence_flags.values() if v)
-
-    selected_odd = maybe_float(odds_1x2.get(best_side))
-    penalty_payload = apply_contextual_penalties(
-        detail=detail,
-        fs=fs,
-        side=best_side,
-        raw_edge=raw_best_edge_value,
-        selected_odd=selected_odd,
-        confluence_count=confluence_count,
-    )
-    adjusted_edge = penalty_payload["adjusted_edge"]
-
-    level = 0
-    if adjusted_edge >= LEVELS_1X2[3]["edge_min"] and confluence_count >= 4:
-        level = 3
-    elif adjusted_edge >= LEVELS_1X2[2]["edge_min"] and confluence_count >= 3:
-        level = 2
-    elif adjusted_edge >= LEVELS_1X2[1]["edge_min"] and confluence_count >= 2:
-        level = 1
-
-    level = min(level, penalty_payload["level_cap"])
-
-    if level == 0:
-        return {
-            "decision": "NO_BET",
-            "side": best_side,
-            "level": 0,
-            "level_name": None,
-            "rationale": [
-                f"Edge brut = {round(raw_best_edge_value * 100, 2)}%.",
-                f"Edge ajusté = {round(adjusted_edge * 100, 2)}%.",
-                "Le signal ne survit pas aux garde-fous contextuels.",
-            ],
-            "market_implied_raw": market_raw,
-            "market_implied_normalized": market_probs,
-            "edges": raw_edges,
-            "allowed_edges": allowed_edges,
-            "best_edge_label": best_side,
-            "raw_best_edge_value": raw_best_edge_value,
-            "best_edge_value": adjusted_edge,
-            "confluence_flags": confluence_flags,
-            "confluence_count": confluence_count,
-            "contextual_flags": penalty_payload["flags"],
-            "contextual_penalties": penalty_payload["penalties"],
-        }
-
-    label_map = {
-        1: {"Home": "WATCH_HOME", "Draw": "WATCH_DRAW", "Away": "WATCH_AWAY"},
-        2: {"Home": "VALUE_HOME", "Draw": "VALUE_DRAW", "Away": "VALUE_AWAY"},
-        3: {"Home": "MAIN_HOME", "Draw": "MAIN_DRAW", "Away": "MAIN_AWAY"},
-    }
-
-    rationale = [
-        f"Best allowed raw edge sur {best_side} = {round(raw_best_edge_value * 100, 2)}%.",
-        f"Edge ajusté = {round(adjusted_edge * 100, 2)}%.",
-        f"Confluence = {confluence_count}/6.",
-    ]
-    if fs.get("match_found"):
-        rationale.append("FootyStats intégré au moteur (PPG + xG prématch + potentials).")
-    if penalty_payload["penalties"]:
-        reasons = ", ".join(p["reason"] for p in penalty_payload["penalties"])
-        rationale.append(f"Pénalités contextuelles appliquées: {reasons}.")
-
-    return {
-        "decision": label_map[level][best_side],
-        "side": best_side,
-        "level": level,
-        "level_name": LEVELS_1X2[level]["name"],
-        "rationale": rationale,
-        "market_implied_raw": market_raw,
-        "market_implied_normalized": market_probs,
-        "edges": raw_edges,
-        "allowed_edges": allowed_edges,
-        "best_edge_label": best_side,
-        "raw_best_edge_value": raw_best_edge_value,
-        "best_edge_value": adjusted_edge,
-        "confluence_flags": confluence_flags,
-        "confluence_count": confluence_count,
-        "contextual_flags": penalty_payload["flags"],
-        "contextual_penalties": penalty_payload["penalties"],
-    }
-
-
-def decide_goals_signal(detail: Dict[str, Any], api_context: Dict[str, Any], fs: Dict[str, Any]) -> Dict[str, Any]:
-    home_gf_avg = safe_div(api_context.get("home_goals_for"), api_context.get("home_played"))
-    away_gf_avg = safe_div(api_context.get("away_goals_for"), api_context.get("away_played"))
-    home_ga_avg = safe_div(api_context.get("home_goals_against"), api_context.get("home_played"))
-    away_ga_avg = safe_div(api_context.get("away_goals_against"), api_context.get("away_played"))
-
-    options: List[Dict[str, Any]] = []
-
-    btts_potential = fs.get("btts_potential")
-    o25_potential = fs.get("o25_potential")
-    u25_potential = fs.get("u25_potential")
-    avg_potential = fs.get("avg_potential")
-    total_xg = fs.get("total_xg_prematch")
-    home_xg = fs.get("team_a_xg_prematch")
-    away_xg = fs.get("team_b_xg_prematch")
-    home_ppg = fs.get("pre_match_home_ppg") or fs.get("home_ppg")
-    away_ppg = fs.get("pre_match_away_ppg") or fs.get("away_ppg")
-
-    # BTTS YES
-    conf_yes = 0
-    yes_reasons = []
-    if btts_potential is not None and btts_potential >= 62:
-        conf_yes += 2
-        yes_reasons.append(f"BTTS potential {btts_potential}")
-    if total_xg is not None and total_xg >= 2.70:
-        conf_yes += 1
-        yes_reasons.append(f"Total xG prematch {total_xg}")
-    if home_xg is not None and away_xg is not None and home_xg >= 1.05 and away_xg >= 1.00:
-        conf_yes += 1
-        yes_reasons.append("Les deux équipes dépassent ~1.0 xG prématch")
-    if avg_potential is not None and avg_potential >= 2.7:
-        conf_yes += 1
-        yes_reasons.append(f"Avg potential {avg_potential}")
-    if home_ga_avg is not None and away_ga_avg is not None and home_ga_avg >= 1.0 and away_ga_avg >= 1.0:
-        conf_yes += 1
-        yes_reasons.append("Les deux profils encaissent assez")
-
-    # BTTS NO
-    conf_no = 0
-    no_reasons = []
-    if btts_potential is not None and btts_potential <= 48:
-        conf_no += 2
-        no_reasons.append(f"BTTS potential bas {btts_potential}")
-    if home_xg is not None and away_xg is not None and (home_xg <= 0.85 or away_xg <= 0.85):
-        conf_no += 1
-        no_reasons.append("Une équipe sous 0.85 xG prématch")
-    if avg_potential is not None and avg_potential <= 2.35:
-        conf_no += 1
-        no_reasons.append(f"Avg potential bas {avg_potential}")
-    if u25_potential is not None and u25_potential >= 58:
-        conf_no += 1
-        no_reasons.append(f"Under 2.5 potential {u25_potential}")
-    if home_ppg is not None and away_ppg is not None and abs((home_ppg or 0) - (away_ppg or 0)) >= 0.70:
-        conf_no += 1
-        no_reasons.append("Mismatch PPG: un camp peut gagner sans encaisser")
-
-    # OVER 2.5
-    conf_over = 0
-    over_reasons = []
-    if o25_potential is not None and o25_potential >= 60:
-        conf_over += 2
-        over_reasons.append(f"Over 2.5 potential {o25_potential}")
-    if total_xg is not None and total_xg >= 2.8:
-        conf_over += 1
-        over_reasons.append(f"Total xG prematch {total_xg}")
-    if home_xg is not None and away_xg is not None and home_xg >= 1.15 and away_xg >= 0.95:
-        conf_over += 1
-        over_reasons.append("xG prématch combiné cohérent avec over")
-    if avg_potential is not None and avg_potential >= 2.85:
-        conf_over += 1
-        over_reasons.append(f"Avg potential {avg_potential}")
-    if home_gf_avg is not None and away_gf_avg is not None and home_gf_avg + away_gf_avg >= 2.7:
-        conf_over += 1
-        over_reasons.append("GF moyens combinés élevés")
-
-    # UNDER 2.5
-    conf_under = 0
-    under_reasons = []
-    if u25_potential is not None and u25_potential >= 60:
-        conf_under += 2
-        under_reasons.append(f"Under 2.5 potential {u25_potential}")
-    if total_xg is not None and total_xg <= 2.35:
-        conf_under += 1
-        under_reasons.append(f"Total xG prematch {total_xg}")
-    if avg_potential is not None and avg_potential <= 2.4:
-        conf_under += 1
-        under_reasons.append(f"Avg potential bas {avg_potential}")
-    if home_gf_avg is not None and away_gf_avg is not None and home_gf_avg + away_gf_avg <= 2.3:
-        conf_under += 1
-        under_reasons.append("GF moyens combinés modestes")
-
-    big_favorite_home = (
-        home_ppg is not None and away_ppg is not None and (home_ppg - away_ppg) >= 1.0
-        and home_xg is not None and home_xg >= 1.8
-    )
-    if big_favorite_home:
-        conf_under -= 2
-        under_reasons.append("Pénalité anti faux under: gros favori offensif")
-
-    options.append({"market": "BTTS_YES", "confidence": conf_yes, "reasons": yes_reasons})
-    options.append({"market": "BTTS_NO", "confidence": conf_no, "reasons": no_reasons})
-    options.append({"market": "OVER_2_5", "confidence": conf_over, "reasons": over_reasons})
-    options.append({"market": "UNDER_2_5", "confidence": conf_under, "reasons": under_reasons})
-
-    best = max(options, key=lambda x: x["confidence"])
-    confidence_count = max(best["confidence"], 0)
-
-    level = 0
-    if confidence_count >= LEVELS_GOALS[3]["confidence_min"]:
-        level = 3
-    elif confidence_count >= LEVELS_GOALS[2]["confidence_min"]:
-        level = 2
-    elif confidence_count >= LEVELS_GOALS[1]["confidence_min"]:
-        level = 1
-
-    if level == 0:
-        return {
-            "decision": "NO_BET",
-            "level": 0,
-            "level_name": None,
-            "market": None,
-            "confidence_count": confidence_count,
-            "rationale": ["Aucun marché buts ne présente assez de confluence."],
-            "home_gf_avg": home_gf_avg,
-            "away_gf_avg": away_gf_avg,
-            "home_ga_avg": home_ga_avg,
-            "away_ga_avg": away_ga_avg,
-            "footystats_features_used": {
-                "btts_potential": btts_potential,
-                "o25_potential": o25_potential,
-                "u25_potential": u25_potential,
-                "avg_potential": avg_potential,
-                "total_xg_prematch": total_xg,
-            },
-        }
-
-    decision_prefix = {1: "WATCH", 2: "VALUE", 3: "MAIN"}[level]
-    decision = f"{decision_prefix}_{best['market']}"
-    rationale = [
-        f"Marché buts retenu = {best['market']}.",
-        f"Confiance = {confidence_count}.",
-        "FootyStats intégré au moteur (potentials + xG prématch + PPG).",
-    ]
-    if best["reasons"]:
-        rationale.append("Signaux: " + " | ".join(best["reasons"]))
-
-    return {
-        "decision": decision,
-        "level": level,
-        "level_name": LEVELS_GOALS[level]["name"],
-        "market": best["market"],
-        "confidence_count": confidence_count,
-        "rationale": rationale,
-        "home_gf_avg": home_gf_avg,
-        "away_gf_avg": away_gf_avg,
-        "home_ga_avg": home_ga_avg,
-        "away_ga_avg": away_ga_avg,
-        "footystats_features_used": {
-            "btts_potential": btts_potential,
-            "o25_potential": o25_potential,
-            "u25_potential": u25_potential,
-            "avg_potential": avg_potential,
-            "total_xg_prematch": total_xg,
-            "team_a_xg_prematch": home_xg,
-            "team_b_xg_prematch": away_xg,
-            "pre_match_home_ppg": home_ppg,
-            "pre_match_away_ppg": away_ppg,
-        },
-    }
-
-
-# ============================================================
-# CORE ANALYSIS
-# ============================================================
-def analyse_fixture_value_core(fixture_id: str, preloaded_footy_matches: Optional[List[Dict[str, Any]]] = None, standings_cache: Optional[Dict[Tuple, Any]] = None) -> Tuple[Dict[str, Any], int]:
-    fixture_data, fixture_status = get_fixture_by_id(fixture_id)
-    if fixture_status != 200:
-        return fixture_data, fixture_status
-
-    match = fixture_data["fixture"]
-    detail = build_fixture_detail(match)
-
-    if is_live_or_not_prematch(detail["status_short"]):
-        return {
-            "status": "ok",
-            "fixture": detail,
-            "decision": "NO_BET",
-            "message": "Fixture is not pre-match anymore",
-        }, 200
-
-    api_context_payload, api_context_status = get_api_context(detail, standings_cache=standings_cache)
-    if api_context_status != 200:
-        return api_context_payload, api_context_status
-
-    api_context = api_context_payload["context"]
-    api_model = build_api_football_model(api_context)
-
-    odds_data, odds_status = call_api_football("odds", {"fixture": fixture_id})
-    if odds_status != 200:
-        return odds_data, odds_status
-
-    odds_response = odds_data["data"].get("response", [])
-    market_pick = pick_best_1x2_market(odds_response, detail["home"], detail["away"])
-    odds_1x2 = market_pick["odds_1x2"]
-
-    footy_payload = get_footystats_for_fixture(detail, preloaded_footy_matches)
-    fs = build_footystats_features(footy_payload)
-    fs_model = build_footystats_model(fs)
-
-    fs_odds_1x2 = build_fs_odds_1x2(fs)
-    if not odds_1x2 and fs_odds_1x2:
-        odds_1x2 = fs_odds_1x2
-        market_pick = {
-            "bookmaker_name": "FootyStats",
-            "bet_name": "1x2",
-            "odds_1x2": fs_odds_1x2,
-        }
-
-    # Fallback 2 — The Odds API (Bet365 / Unibet)
-    if not odds_1x2:
-        odds_api_result = get_odds_api_1x2(detail)
-        if odds_api_result:
-            odds_1x2 = odds_api_result["odds_1x2"]
-            market_pick = {
-                "bookmaker_name": odds_api_result.get("bookmaker_name", "OddsAPI"),
-                "bet_name": "h2h",
-                "odds_1x2": odds_1x2,
+            prob = dc_probs.get(side_map[side], 0.0)
+            edge = prob - (1.0 / odd)
+            min_edge_tier = MIN_EDGE.get(tier, 0.03)
+
+            if edge <= min_edge_tier:
+                continue
+            if side == "Home" and odd < MIN_ODD_HOME_AWAY:
+                continue
+            if side == "Away" and odd < MIN_ODD_HOME_AWAY:
+                continue
+            if side == "Draw" and odd < MIN_ODD_DRAW:
+                continue
+            if odd > MAX_ODD_SIGNAL:
+                continue
+
+            # Filtre glamour outsider sur P0
+            if tier == "P0" and side == "Away" and prob < 0.35:
+                continue
+
+            conf = calculate_confidence(prob, edge, dcs, tier)
+            if conf < MIN_CONFIDENCE_BET:
+                continue
+
+            # Décision label
+            prefix = {"P0": "ELITE", "N1": "MAIN", "N2": "VALUE", "N3": "WATCH"}.get(tier, "WATCH")
+            decision = f"{prefix}_{side.upper()}"
+            level = {"P0": 3, "N1": 3, "N2": 2, "N3": 1}.get(tier, 1)
+
+            bankroll = get_bankroll()
+            stake = kelly_stake(prob, odd, bankroll)
+
+            best_signal = {
+                "mode": "BET",
+                "side": side,
+                "decision": decision,
+                "level": level,
+                "level_name": prefix,
+                "odd": odd,
+                "raw_edge": edge,
+                "adjusted_edge": edge,
+                "edge": edge,
+                "prob": prob,
+                "confidence": conf,
+                "stake": stake,
+                "odds_source": odds_source,
             }
+            break  # Première opportunité valide
 
-    if not odds_1x2:
-        return {
-            "status": "ok",
-            "fixture": detail,
-            "decision": "NO_BET",
-            "message": "No complete 1X2 market found for this fixture",
-            "footystats": footy_payload,
-        }, 200
+    # ---- 7. MODE SIGNAL (pas de cotes ou aucun BET trouvé) ----
+    if not best_signal:
+        for dc_key, side in [("H", "Home"), ("A", "Away")]:
+            prob = dc_probs.get(dc_key, 0.0)
+            if prob < MIN_PROB_SIGNAL:
+                continue
 
-    hybrid_probs = weighted_blend_probabilities(
-        api_model["probabilities"],
-        fs_model["probabilities"],
-        left_weight=0.55,
-        right_weight=0.45,
-    )
+            # Vérification cohérence via predictions API
+            pred = get_predictions_api(fixture_id)
+            if pred:
+                pct = pred.get("predictions", {}).get("percent", {})
+                winner_key = max({"home": pct.get("home", "0%"), "draw": pct.get("draw", "0%"),
+                                  "away": pct.get("away", "0%")}.items(),
+                                 key=lambda x: float(str(x[1]).replace("%", "")) if x[1] else 0)
+                api_side = winner_key[0].capitalize()
+                if api_side and api_side != side:
+                    continue  # Incohérence modèle / API
 
-    decision_data = decide_value_signal(
-        detail=detail,
-        odds_1x2=odds_1x2,
-        api_context=api_context,
-        api_probs=api_model["probabilities"],
-        fs_probs=fs_model["probabilities"],
-        hybrid_probs=hybrid_probs,
-        fs=fs,
-    )
+            conf = calculate_confidence(prob, 0.05, dcs, tier)
+            if conf < MIN_CONFIDENCE_SIGNAL:
+                continue
 
+            prefix = {"P0": "ELITE", "N1": "MAIN", "N2": "VALUE", "N3": "WATCH"}.get(tier, "WATCH")
+            decision = f"{prefix}_{side.upper()}_SIGNAL"
+            level = {"P0": 3, "N1": 3, "N2": 2, "N3": 1}.get(tier, 1)
+
+            best_signal = {
+                "mode": "SIGNAL",
+                "side": side,
+                "decision": decision,
+                "level": level,
+                "level_name": prefix,
+                "odd": None,
+                "raw_edge": None,
+                "adjusted_edge": None,
+                "edge": None,
+                "prob": prob,
+                "confidence": conf,
+                "stake": 0.0,
+                "odds_source": None,
+            }
+            break
+
+    if not best_signal:
+        return None, 200
+
+    # ---- 8. Construction du signal complet ----
+    fs_match_found = fs_raw is not None
     return {
         "status": "ok",
         "build_id": BUILD_ID,
         "fixture": detail,
-        "context": api_context,
-        "bookmaker_name": market_pick["bookmaker_name"],
-        "market_name": market_pick["bet_name"],
+        "fixture_id": detail["fixture_id"],
+        "kickoff_utc": detail["kickoff_utc"],
+        "league_id": league_id,
+        "league_name": detail["league_name"],
+        "tier": tier,
+        "country": detail["country"],
+        "home": detail["home"],
+        "away": detail["away"],
+        "hxg": round(hxg, 3),
+        "axg": round(axg, 3),
+        "xg_source": xg_source,
+        "dcs": round(dcs, 3),
+        "dc_probs": {k: round(v, 4) for k, v in dc_probs.items()},
+        "footystats_match_found": fs_match_found,
         "odds_1x2": odds_1x2,
-        "api_model_probabilities": api_model["probabilities"],
-        "api_model_raw_scores": api_model["raw_scores"],
-        "footystats_model_probabilities": fs_model["probabilities"],
-        "footystats_model_raw_scores": fs_model["raw_scores"],
-        "hybrid_model_probabilities": hybrid_probs,
-        "market_implied_raw": decision_data["market_implied_raw"],
-        "market_implied_normalized": decision_data["market_implied_normalized"],
-        "edges": decision_data["edges"],
-        "allowed_edges": decision_data["allowed_edges"],
-        "best_edge_label": decision_data["best_edge_label"],
-        "raw_best_edge_value": decision_data["raw_best_edge_value"],
-        "best_edge_value": decision_data["best_edge_value"],
-        "side": decision_data["side"],
-        "level": decision_data["level"],
-        "level_name": decision_data["level_name"],
-        "decision": decision_data["decision"],
-        "rationale": decision_data["rationale"],
-        "confluence_flags": decision_data["confluence_flags"],
-        "confluence_count": decision_data["confluence_count"],
-        "contextual_flags": decision_data["contextual_flags"],
-        "contextual_penalties": decision_data["contextual_penalties"],
-        "footystats": {
-            "enabled": bool(FOOTYSTATS_KEY),
-            "match_found": fs.get("match_found", False),
-            "match_id": fs.get("match_id"),
-            "mapping_score": fs.get("mapping_score"),
-            "features": fs,
-        },
+        **best_signal,
     }, 200
 
-
-def analyse_fixture_goals_core(fixture_id: str, preloaded_footy_matches: Optional[List[Dict[str, Any]]] = None, standings_cache: Optional[Dict[Tuple, Any]] = None) -> Tuple[Dict[str, Any], int]:
-    fixture_data, fixture_status = get_fixture_by_id(fixture_id)
-    if fixture_status != 200:
-        return fixture_data, fixture_status
-
-    match = fixture_data["fixture"]
-    detail = build_fixture_detail(match)
-
-    if is_live_or_not_prematch(detail["status_short"]):
-        return {
-            "status": "ok",
-            "fixture": detail,
-            "decision": "NO_BET",
-            "message": "Fixture is not pre-match anymore",
-        }, 200
-
-    api_context_payload, api_context_status = get_api_context(detail, standings_cache=standings_cache)
-    if api_context_status != 200:
-        return api_context_payload, api_context_status
-
-    api_context = api_context_payload["context"]
-    footy_payload = get_footystats_for_fixture(detail, preloaded_footy_matches)
-    fs = build_footystats_features(footy_payload)
-
-    decision_data = decide_goals_signal(detail, api_context, fs)
-
-    return {
-        "status": "ok",
-        "build_id": BUILD_ID,
-        "fixture": detail,
-        "goals_context": api_context,
-        "level": decision_data["level"],
-        "level_name": decision_data["level_name"],
-        "market": decision_data["market"],
-        "confidence_count": decision_data["confidence_count"],
-        "decision": decision_data["decision"],
-        "rationale": decision_data["rationale"],
-        "home_gf_avg": decision_data["home_gf_avg"],
-        "away_gf_avg": decision_data["away_gf_avg"],
-        "home_ga_avg": decision_data["home_ga_avg"],
-        "away_ga_avg": decision_data["away_ga_avg"],
-        "footystats": {
-            "enabled": bool(FOOTYSTATS_KEY),
-            "match_found": fs.get("match_found", False),
-            "match_id": fs.get("match_id"),
-            "mapping_score": fs.get("mapping_score"),
-            "features": decision_data["footystats_features_used"],
-        },
-    }, 200
-
-
 # ============================================================
-# FORMATTERS
+# FORMATTERS TELEGRAM
 # ============================================================
-def summarize_1x2_signal(detail: Dict[str, Any], analysis: Dict[str, Any], odds_1x2: Dict[str, Any]) -> str:
-    side = analysis.get("side")
-    return (
-        "APEXFOOTBALL 1X2 HYBRID\n\n"
-        f"{detail['home']} vs {detail['away']}\n"
-        f"{detail['league_name']} ({detail['country']})\n"
-        f"{format_match_time(detail['date'])}\n\n"
-        f"Decision: {analysis['decision']}\n"
-        f"Level: {analysis.get('level')} - {analysis.get('level_name')}\n"
-        f"Side: {side}\n"
-        f"Odd: {odds_1x2.get(side) if side else 'N/A'}\n"
-        f"Raw edge: {round(analysis['raw_best_edge_value'] * 100, 2) if analysis.get('raw_best_edge_value') is not None else 'N/A'}%\n"
-        f"Adjusted edge: {round(analysis['best_edge_value'] * 100, 2) if analysis.get('best_edge_value') is not None else 'N/A'}%\n"
-        f"Confluence: {analysis.get('confluence_count', 0)}/6\n"
-        f"FootyStats match: {'YES' if analysis.get('footystats', {}).get('match_found') else 'NO'}\n"
-        f"Rationale: {' | '.join(analysis.get('rationale', []))}"
-    )
-
-
-def summarize_goals_signal(detail: Dict[str, Any], analysis: Dict[str, Any]) -> str:
-    return (
-        "APEXFOOTBALL GOALS HYBRID\n\n"
-        f"{detail['home']} vs {detail['away']}\n"
-        f"{detail['league_name']} ({detail['country']})\n"
-        f"{format_match_time(detail['date'])}\n\n"
-        f"Decision: {analysis['decision']}\n"
-        f"Level: {analysis.get('level')} - {analysis.get('level_name')}\n"
-        f"Market: {analysis.get('market')}\n"
-        f"Confidence: {analysis.get('confidence_count', 0)}\n"
-        f"FootyStats match: {'YES' if analysis.get('footystats', {}).get('match_found') else 'NO'}\n"
-        f"Rationale: {' | '.join(analysis.get('rationale', []))}"
-    )
-
-
-# ============================================================
-# SQLITE / JOURNALISATION / BACKTEST
-# ============================================================
-def db_connect() -> sqlite3.Connection:
-    # Crée le répertoire parent si nécessaire (ex: /data non encore monté)
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir and not os.path.exists(db_dir):
-        try:
-            os.makedirs(db_dir, exist_ok=True)
-        except OSError as exc:
-            logger.warning("Cannot create DB dir %s: %s — falling back to /tmp", db_dir, exc)
-            # Fallback sur /tmp si le disk n'est pas monté
-            fallback = os.path.join("/tmp", os.path.basename(DB_PATH))
-            conn = sqlite3.connect(fallback, timeout=30, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            return conn
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db() -> None:
-    try:
-        with closing(db_connect()) as conn:
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_uid TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL,
-                build_id TEXT NOT NULL,
-                fixture_id INTEGER NOT NULL,
-                match_date TEXT,
-                kickoff_utc TEXT,
-                league_id INTEGER,
-                league_name TEXT,
-                country TEXT,
-                home_team TEXT,
-                away_team TEXT,
-                market TEXT,
-                side TEXT,
-                decision TEXT NOT NULL,
-                level INTEGER NOT NULL,
-                level_name TEXT,
-                odd REAL,
-                raw_edge REAL,
-                adjusted_edge REAL,
-                confluence_count INTEGER,
-                confidence_count INTEGER,
-                rationale TEXT,
-                contextual_flags TEXT,
-                contextual_penalties TEXT,
-                telegram_sent INTEGER DEFAULT 0,
-                telegram_http_status INTEGER,
-                telegram_message_id TEXT,
-                result_status TEXT DEFAULT 'pending',
-                match_status TEXT,
-                home_goals INTEGER,
-                away_goals INTEGER,
-                bet_outcome TEXT,
-                stake REAL DEFAULT 1.0,
-                profit REAL DEFAULT 0.0,
-                resolved_at TEXT
-            )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_fixture_id ON signals(fixture_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_result_status ON signals(result_status)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_level ON signals(level)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_build_id ON signals(build_id)")
-            conn.commit()
-            logger.info("DB ready at %s", DB_PATH)
-    except Exception as exc:
-        logger.error("init_db failed: %s — bot will start but DB may be unavailable", exc)
-
-
-def json_dumps_safe(value: Any) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False)
-    except Exception:
-        return json.dumps(str(value), ensure_ascii=False)
-
-
-def extract_telegram_message_id(telegram_data: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not isinstance(telegram_data, dict):
-        return None
-    try:
-        return str(
-            telegram_data.get("telegram_response", {})
-            .get("result", {})
-            .get("message_id")
-        )
-    except Exception:
-        return None
-
-
-def build_signal_uid(
-    fixture_id: Any,
-    market: Optional[str],
-    side: Optional[str],
-    decision: Optional[str],
-    level: Optional[int],
-    kickoff_utc: Optional[str],
-) -> str:
-    match_day = str(kickoff_utc or "")[:10]
-    return "|".join([
-        str(BUILD_ID),
-        str(fixture_id),
-        str(match_day),
-        str(market or ""),
-        str(side or ""),
-        str(decision or ""),
-        str(level or 0),
-    ])
-
-
-def infer_market_from_decision(decision: Optional[str]) -> Optional[str]:
-    if not decision:
-        return None
-    d = str(decision).upper()
-    if d.endswith("_HOME") or d.endswith("_DRAW") or d.endswith("_AWAY"):
-        return "1X2"
-    for market in ["BTTS_YES", "BTTS_NO", "OVER_2_5", "UNDER_2_5"]:
-        if market in d:
-            return market
-    return None
-
-
-def pick_goals_logged_odd(analysis: Dict[str, Any], footystats: Optional[Dict[str, Any]] = None) -> Optional[float]:
-    market = analysis.get("market")
-    if not market:
-        return None
-    fs = footystats or analysis.get("footystats_features_used") or {}
-    if not isinstance(fs, dict):
-        return None
-    if market == "BTTS_YES":
-        return maybe_float(fs.get("odds_btts_yes"))
-    if market == "BTTS_NO":
-        return maybe_float(fs.get("odds_btts_no"))
-    if market == "OVER_2_5":
-        return maybe_float(fs.get("odds_ft_over25"))
-    if market == "UNDER_2_5":
-        return maybe_float(fs.get("odds_ft_under25"))
-    return None
-
-
-def save_signal_record(record: Dict[str, Any]) -> Dict[str, Any]:
-    required = ["signal_uid", "created_at", "build_id", "fixture_id", "decision", "level"]
-    for key in required:
-        if record.get(key) is None:
-            raise ValueError(f"Missing required record field: {key}")
-    with closing(db_connect()) as conn:
-        conn.execute("""
-        INSERT OR IGNORE INTO signals (
-            signal_uid, created_at, build_id, fixture_id, match_date, kickoff_utc,
-            league_id, league_name, country, home_team, away_team,
-            market, side, decision, level, level_name,
-            odd, raw_edge, adjusted_edge, confluence_count, confidence_count,
-            rationale, contextual_flags, contextual_penalties,
-            telegram_sent, telegram_http_status, telegram_message_id, stake
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            record.get("signal_uid"), record.get("created_at"), record.get("build_id"),
-            record.get("fixture_id"), record.get("match_date"), record.get("kickoff_utc"),
-            record.get("league_id"), record.get("league_name"), record.get("country"),
-            record.get("home_team"), record.get("away_team"),
-            record.get("market"), record.get("side"), record.get("decision"),
-            record.get("level"), record.get("level_name"),
-            record.get("odd"), record.get("raw_edge"), record.get("adjusted_edge"),
-            record.get("confluence_count"), record.get("confidence_count"),
-            record.get("rationale"), record.get("contextual_flags"), record.get("contextual_penalties"),
-            1 if record.get("telegram_sent") else 0,
-            record.get("telegram_http_status"), record.get("telegram_message_id"),
-            record.get("stake", DEFAULT_STAKE),
-        ))
-        conn.commit()
-        row = conn.execute(
-            "SELECT id, signal_uid FROM signals WHERE signal_uid = ?",
-            (record["signal_uid"],)
-        ).fetchone()
-    return {
-        "status": "ok",
-        "signal_uid": record["signal_uid"],
-        "row_id": int(row["id"]) if row else None,
-    }
-
-
-def log_1x2_signal(
-    detail: Dict[str, Any],
-    analysis: Dict[str, Any],
-    odds_1x2: Dict[str, Any],
-    telegram_data: Optional[Dict[str, Any]] = None,
-    telegram_http_status: Optional[int] = None,
-) -> Dict[str, Any]:
-    market = "1X2"
-    side = analysis.get("side")
-    odd = maybe_float(odds_1x2.get(side)) if side else None
+def log_signal(signal: Dict, tg_data: Optional[Dict] = None,
+               tg_status: Optional[int] = None) -> Dict:
+    """Enregistre un signal 1X2 en DB."""
+    odd = signal.get("odd")
+    # Pour mode SIGNAL sans cote → on enregistre quand même (sans odd)
     record = {
         "signal_uid": build_signal_uid(
-            detail.get("fixture_id"), market, side,
-            analysis.get("decision"), analysis.get("level"),
-            detail.get("kickoff_utc") or detail.get("date"),
+            signal.get("fixture_id"), "1X2", signal.get("side"),
+            signal.get("decision"), signal.get("level"),
+            signal.get("kickoff_utc")
         ),
         "created_at": now_utc().isoformat(),
         "build_id": BUILD_ID,
-        "fixture_id": maybe_int(detail.get("fixture_id")),
-        "match_date": str(detail.get("date") or "")[:10],
-        "kickoff_utc": detail.get("kickoff_utc") or detail.get("date"),
-        "league_id": maybe_int(detail.get("league_id")),
-        "league_name": detail.get("league_name"),
-        "country": detail.get("country"),
-        "home_team": detail.get("home"),
-        "away_team": detail.get("away"),
-        "market": market,
-        "side": side,
-        "decision": analysis.get("decision"),
-        "level": maybe_int(analysis.get("level")) or 0,
-        "level_name": analysis.get("level_name"),
+        "fixture_id": maybe_int(signal.get("fixture_id")),
+        "match_date": str(signal.get("kickoff_utc") or "")[:10],
+        "kickoff_utc": signal.get("kickoff_utc"),
+        "league_id": maybe_int(signal.get("league_id")),
+        "league_name": signal.get("league_name"),
+        "tier": signal.get("tier"),
+        "country": signal.get("country"),
+        "home_team": signal.get("home"),
+        "away_team": signal.get("away"),
+        "market": "1X2",
+        "side": signal.get("side"),
+        "mode": signal.get("mode", "BET"),
+        "decision": signal.get("decision"),
+        "level": maybe_int(signal.get("level")) or 0,
+        "level_name": signal.get("level_name"),
         "odd": odd,
-        "raw_edge": maybe_float(analysis.get("raw_best_edge_value")),
-        "adjusted_edge": maybe_float(analysis.get("best_edge_value")),
-        "confluence_count": maybe_int(analysis.get("confluence_count")),
-        "confidence_count": None,
-        "rationale": json_dumps_safe(analysis.get("rationale", [])),
-        "contextual_flags": json_dumps_safe(analysis.get("contextual_flags", {})),
-        "contextual_penalties": json_dumps_safe(analysis.get("contextual_penalties", [])),
-        "telegram_sent": telegram_http_status == 200,
-        "telegram_http_status": telegram_http_status,
-        "telegram_message_id": extract_telegram_message_id(telegram_data),
-        "stake": DEFAULT_STAKE,
-    }
-    return save_signal_record(record)
-
-
-def log_goals_signal(
-    detail: Dict[str, Any],
-    analysis: Dict[str, Any],
-    telegram_data: Optional[Dict[str, Any]] = None,
-    telegram_http_status: Optional[int] = None,
-) -> Dict[str, Any]:
-    market = analysis.get("market") or infer_market_from_decision(analysis.get("decision"))
-    odd = pick_goals_logged_odd(analysis)
-
-    # Ne pas enregistrer un pari goals sans cote exploitable
-    if odd is None:
-        logger.warning(
-            "SKIP goals signal logging: missing odd | fixture_id=%s | market=%s | decision=%s",
-            detail.get("fixture_id"), market, analysis.get("decision"),
-        )
-        return {
-            "status": "skipped",
-            "reason": "missing_odd",
-            "fixture_id": maybe_int(detail.get("fixture_id")),
-            "market": market,
-            "decision": analysis.get("decision"),
-        }
-
-    record = {
-        "signal_uid": build_signal_uid(
-            detail.get("fixture_id"), market, None,
-            analysis.get("decision"), analysis.get("level"),
-            detail.get("kickoff_utc") or detail.get("date"),
-        ),
-        "created_at": now_utc().isoformat(),
-        "build_id": BUILD_ID,
-        "fixture_id": maybe_int(detail.get("fixture_id")),
-        "match_date": str(detail.get("date") or "")[:10],
-        "kickoff_utc": detail.get("kickoff_utc") or detail.get("date"),
-        "league_id": maybe_int(detail.get("league_id")),
-        "league_name": detail.get("league_name"),
-        "country": detail.get("country"),
-        "home_team": detail.get("home"),
-        "away_team": detail.get("away"),
-        "market": market,
-        "side": None,
-        "decision": analysis.get("decision"),
-        "level": maybe_int(analysis.get("level")) or 0,
-        "level_name": analysis.get("level_name"),
-        "odd": odd,
-        "raw_edge": None,
-        "adjusted_edge": None,
+        "raw_edge": maybe_float(signal.get("raw_edge")),
+        "adjusted_edge": maybe_float(signal.get("adjusted_edge")),
+        "prob": maybe_float(signal.get("prob")),
+        "hxg": maybe_float(signal.get("hxg")),
+        "axg": maybe_float(signal.get("axg")),
+        "xg_source": signal.get("xg_source"),
+        "dcs": maybe_float(signal.get("dcs")),
+        "confidence": maybe_int(signal.get("confidence")),
         "confluence_count": None,
-        "confidence_count": maybe_int(analysis.get("confidence_count")),
-        "rationale": json_dumps_safe(analysis.get("rationale", [])),
-        "contextual_flags": json_dumps_safe({}),
+        "confidence_count": None,
+        "rationale": json_dumps_safe(signal.get("dc_probs", {})),
+        "contextual_flags": json_dumps_safe({"tier": signal.get("tier"),
+                                              "footystats": signal.get("footystats_match_found")}),
         "contextual_penalties": json_dumps_safe([]),
-        "telegram_sent": telegram_http_status == 200,
-        "telegram_http_status": telegram_http_status,
-        "telegram_message_id": extract_telegram_message_id(telegram_data),
-        "stake": DEFAULT_STAKE,
+        "telegram_sent": tg_status == 200,
+        "telegram_http_status": tg_status,
+        "telegram_message_id": extract_telegram_message_id(tg_data),
+        "stake": maybe_float(signal.get("stake")) or 0.0,
     }
+    # Mode SIGNAL sans cote: enregistre quand même pour tracking de précision
     return save_signal_record(record)
 
-
 # ============================================================
-# RESOLUTION / RESULTATS / PROFIT
-# ============================================================
-FINAL_STATUSES = {"FT", "AET", "PEN"}
-VOID_STATUSES = {"CANC", "PST", "ABD", "AWD", "WO"}
-
-
-def compute_bet_outcome(
-    market: Optional[str],
-    side: Optional[str],
-    home_goals: Optional[int],
-    away_goals: Optional[int],
-    match_status: Optional[str],
-) -> str:
-    if match_status in VOID_STATUSES:
-        return "void"
-    if home_goals is None or away_goals is None:
-        return "pending"
-    total_goals = home_goals + away_goals
-    if market == "1X2":
-        if side == "Home":
-            return "win" if home_goals > away_goals else "loss"
-        if side == "Draw":
-            return "win" if home_goals == away_goals else "loss"
-        if side == "Away":
-            return "win" if away_goals > home_goals else "loss"
-        return "loss"
-    if market == "BTTS_YES":
-        return "win" if home_goals > 0 and away_goals > 0 else "loss"
-    if market == "BTTS_NO":
-        return "win" if home_goals == 0 or away_goals == 0 else "loss"
-    if market == "OVER_2_5":
-        return "win" if total_goals >= 3 else "loss"
-    if market == "UNDER_2_5":
-        return "win" if total_goals <= 2 else "loss"
-    return "loss"
-
-
-def compute_profit(outcome: str, odd: Optional[float], stake: float) -> float:
-    if outcome == "win":
-        if odd is None or odd <= 1:
-            return 0.0
-        return round((odd - 1.0) * stake, 4)
-    if outcome == "loss":
-        return round(-stake, 4)
-    return 0.0
-
-
-def resolve_fixture_signals(fixture_id: int) -> Dict[str, Any]:
-    fixture_data, fixture_status = get_fixture_by_id(str(fixture_id))
-    if fixture_status != 200:
-        return {"status": "error", "fixture_id": fixture_id, "details": fixture_data}
-
-    match = fixture_data["fixture"]
-    status_short = match.get("fixture", {}).get("status", {}).get("short")
-    home_goals = maybe_int(match.get("goals", {}).get("home"))
-    away_goals = maybe_int(match.get("goals", {}).get("away"))
-
-    if status_short not in FINAL_STATUSES and status_short not in VOID_STATUSES:
-        return {"status": "pending", "fixture_id": fixture_id, "match_status": status_short}
-
-    with closing(db_connect()) as conn:
-        rows = conn.execute("""
-            SELECT * FROM signals
-            WHERE fixture_id = ? AND result_status = 'pending'
-        """, (fixture_id,)).fetchall()
-
-        resolved_count = 0
-        for row in rows:
-            outcome = compute_bet_outcome(
-                market=row["market"], side=row["side"],
-                home_goals=home_goals, away_goals=away_goals,
-                match_status=status_short,
-            )
-            profit = compute_profit(
-                outcome=outcome,
-                odd=maybe_float(row["odd"]),
-                stake=maybe_float(row["stake"]) or DEFAULT_STAKE,
-            )
-            conn.execute("""
-                UPDATE signals
-                SET result_status = 'resolved', match_status = ?,
-                    home_goals = ?, away_goals = ?,
-                    bet_outcome = ?, profit = ?, resolved_at = ?
-                WHERE id = ?
-            """, (status_short, home_goals, away_goals, outcome, profit, now_utc().isoformat(), row["id"]))
-            resolved_count += 1
-        conn.commit()
-
-    return {
-        "status": "ok",
-        "fixture_id": fixture_id,
-        "match_status": status_short,
-        "home_goals": home_goals,
-        "away_goals": away_goals,
-        "resolved_count": resolved_count,
-    }
-
-
-def resolve_pending_signals(limit: int = RESOLVE_BATCH_LIMIT) -> Dict[str, Any]:
-    with closing(db_connect()) as conn:
-        rows = conn.execute("""
-            SELECT DISTINCT fixture_id FROM signals
-            WHERE result_status = 'pending'
-            ORDER BY created_at ASC LIMIT ?
-        """, (limit,)).fetchall()
-
-    fixture_ids = [int(r["fixture_id"]) for r in rows]
-    results = []
-    total_resolved = 0
-
-    for fixture_id in fixture_ids:
-        try:
-            result = resolve_fixture_signals(fixture_id)
-            results.append(result)
-            if result.get("status") == "ok":
-                total_resolved += int(result.get("resolved_count", 0))
-        except Exception as exc:
-            logger.exception("resolve_fixture_signals failed for fixture_id=%s", fixture_id)
-            results.append({"status": "error", "fixture_id": fixture_id, "details": str(exc)})
-
-    return {
-        "status": "ok",
-        "checked_fixtures": len(fixture_ids),
-        "resolved_signals": total_resolved,
-        "results": results,
-    }
-
-
-# ============================================================
-# SCHEDULER — scan toutes les heures de 07h00 à 23h00 UTC
+# SCHEDULER — SCAN PRINCIPAL
 # ============================================================
 def _run_full_scan_job_core(trigger: str = "scheduler") -> int:
     hour = now_utc().hour
@@ -2148,55 +1375,40 @@ def _run_full_scan_job_core(trigger: str = "scheduler") -> int:
         raise RuntimeError(f"get_fixtures_by_date failed: status={fixtures_status}")
 
     fixtures = fixtures_data["data"].get("response", [])
-    footy_matches = None
-    if FOOTYSTATS_KEY:
-        footy_payload, footy_status = get_footystats_matches_by_date(date_str)
-        if footy_status == 200:
-            footy_matches = footystats_data_as_list(footy_payload["data"])
-        else:
-            logger.warning("FootyStats matches fetch failed | status=%s", footy_status)
+    fs_matches = get_footystats_matches_cached()
+    standings_cache: Dict[Tuple, Any] = {}
 
     signals_sent = 0
-    standings_cache: Dict[Tuple, Any] = {}  # Cache intra-scan: évite N appels standings pour la même ligue
 
     for match in fixtures:
-        if not is_target_league_by_id(match):
+        league_id = match.get("league", {}).get("id")
+        if league_id not in LEAGUE_CONFIG:
             continue
         if not is_priority_fixture(match):
             continue
         if not is_pre_match_fixture(match):
             continue
 
-        detail = build_fixture_detail(match)
-        fixture_id = str(detail["fixture_id"])
+        fixture_id = str(match.get("fixture", {}).get("id", ""))
+        if not fixture_id:
+            continue
 
         try:
-            a1x2, s1x2 = analyse_fixture_value_core(fixture_id, preloaded_footy_matches=footy_matches, standings_cache=standings_cache)
-            if s1x2 == 200 and a1x2.get("decision") != "NO_BET" and (a1x2.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
-                tg_data, tg_status = send_telegram_message(
-                    summarize_1x2_signal(a1x2["fixture"], a1x2, a1x2["odds_1x2"])
-                )
-                log_1x2_signal(
-                    detail=a1x2["fixture"], analysis=a1x2, odds_1x2=a1x2["odds_1x2"],
-                    telegram_data=tg_data, telegram_http_status=tg_status,
-                )
+            signal, status = analyse_fixture_core(
+                fixture_id,
+                preloaded_fs_matches=fs_matches,
+                standings_cache=standings_cache,
+            )
+            if status == 200 and signal and signal.get("level", 0) >= MIN_SIGNAL_LEVEL_AUTO:
+                msg = format_signal_message(signal)
+                tg_data, tg_status = send_telegram_message(msg)
+                log_signal(signal, tg_data=tg_data, tg_status=tg_status)
                 signals_sent += 1
+                logger.info("Signal | %s | %s %s | mode=%s | conf=%s",
+                            signal.get("league_name"), signal.get("home"),
+                            signal.get("away"), signal.get("mode"), signal.get("confidence"))
         except Exception:
-            logger.exception("1X2 scan failed | fixture_id=%s", fixture_id)
-
-        try:
-            agoals, sgoals = analyse_fixture_goals_core(fixture_id, preloaded_footy_matches=footy_matches, standings_cache=standings_cache)
-            if sgoals == 200 and agoals.get("decision") != "NO_BET" and (agoals.get("level") or 0) >= MIN_SIGNAL_LEVEL_AUTO:
-                tg_data, tg_status = send_telegram_message(
-                    summarize_goals_signal(agoals["fixture"], agoals)
-                )
-                log_goals_signal(
-                    detail=agoals["fixture"], analysis=agoals,
-                    telegram_data=tg_data, telegram_http_status=tg_status,
-                )
-                signals_sent += 1
-        except Exception:
-            logger.exception("GOALS scan failed | fixture_id=%s", fixture_id)
+            logger.exception("Scan failed | fixture_id=%s", fixture_id)
 
         if signals_sent >= MAX_SCAN_RESULTS:
             break
@@ -2204,65 +1416,48 @@ def _run_full_scan_job_core(trigger: str = "scheduler") -> int:
     if signals_sent == 0:
         send_telegram_message(
             f"🔍 Scan {trigger} {date_str} {timestamp}\n"
-            f"Aucun signal VALUE/MAIN détecté sur les ligues surveillées."
+            f"Aucun signal détecté sur les ligues surveillées."
         )
-
     return signals_sent
-
 
 def run_full_scan_job(trigger: str = "scheduler") -> Dict[str, Any]:
     if not SCAN_LOCK.acquire(blocking=False):
-        logger.warning("Scan refused: another scan is already running | trigger=%s", trigger)
+        logger.warning("Scan refused: already running | trigger=%s", trigger)
         return {"status": "busy", "message": "scan already running"}
-
     started = time.time()
     SCAN_STATE["running"] = True
     SCAN_STATE["started_at"] = now_utc().isoformat()
     SCAN_STATE["last_error"] = None
-
     try:
         signals_sent = _run_full_scan_job_core(trigger=trigger)
         SCAN_STATE["last_success"] = now_utc().isoformat()
         SCAN_STATE["last_signals_sent"] = signals_sent
         SCAN_STATE["last_duration_seconds"] = round(time.time() - started, 2)
-        logger.info(
-            "Scan completed | trigger=%s | signals_sent=%s | duration=%ss",
-            trigger, signals_sent, SCAN_STATE["last_duration_seconds"],
-        )
-        return {
-            "status": "ok",
-            "signals_sent": signals_sent,
-            "duration_seconds": SCAN_STATE["last_duration_seconds"],
-        }
+        logger.info("Scan completed | trigger=%s | signals=%s | duration=%ss",
+                    trigger, signals_sent, SCAN_STATE["last_duration_seconds"])
+        return {"status": "ok", "signals_sent": signals_sent,
+                "duration_seconds": SCAN_STATE["last_duration_seconds"]}
     except Exception as exc:
         SCAN_STATE["last_error"] = str(exc)
         SCAN_STATE["last_duration_seconds"] = round(time.time() - started, 2)
         logger.exception("Scan crashed | trigger=%s", trigger)
-        return {
-            "status": "error",
-            "message": str(exc),
-            "duration_seconds": SCAN_STATE["last_duration_seconds"],
-        }
+        return {"status": "error", "message": str(exc),
+                "duration_seconds": SCAN_STATE["last_duration_seconds"]}
     finally:
         SCAN_STATE["running"] = False
         SCAN_LOCK.release()
 
-
-def resolve_pending_signals_job():
+def resolve_pending_signals_job() -> None:
     if not AUTO_RESOLVE_ENABLED:
         return
     try:
         result = resolve_pending_signals(limit=RESOLVE_BATCH_LIMIT)
-        logger.info(
-            "resolve_pending_signals_job done | checked=%s | resolved=%s",
-            result.get("checked_fixtures"),
-            result.get("resolved_signals"),
-        )
+        logger.info("resolve_job done | checked=%s | resolved=%s",
+                    result.get("checked_fixtures"), result.get("resolved_signals"))
     except Exception:
         logger.exception("resolve_pending_signals_job failed")
 
-
-def _scheduler_loop():
+def _scheduler_loop() -> None:
     schedule.every().hour.at(":00").do(lambda: run_full_scan_job(trigger="scheduler"))
     schedule.every(30).minutes.do(resolve_pending_signals_job)
     while True:
@@ -2272,163 +1467,94 @@ def _scheduler_loop():
             logger.exception("Scheduler loop failed")
         time.sleep(30)
 
-
-def start_scheduler_if_enabled():
+def start_scheduler_if_enabled() -> None:
     if not ENABLE_SCHEDULER:
         logger.info("Scheduler disabled (ENABLE_SCHEDULER=0)")
         return
-    logger.info("Scheduler enabled — scan every hour %sh00–%sh00 UTC", SCAN_START_HOUR, SCAN_END_HOUR)
+    logger.info("Scheduler enabled — scan every hour %sh00–%sh00 UTC",
+                SCAN_START_HOUR, SCAN_END_HOUR)
     threading.Thread(target=_scheduler_loop, daemon=True, name="ApexScheduler").start()
-
-
-start_scheduler_if_enabled()
-
-# Init DB au démarrage (gunicorn + dev)
-init_db()
-logger.info("DB initialized at %s", DB_PATH)
-
 
 # ============================================================
 # TELEGRAM WEBHOOK
 # ============================================================
-def set_telegram_webhook(url: str) -> Tuple[Dict[str, Any], int]:
-    if not BOT_TOKEN:
-        return {"status": "error", "message": "BOT_TOKEN is missing"}, 500
-    params: Dict[str, Any] = {"url": url}
-    if WEBHOOK_SECRET:
-        params["secret_token"] = WEBHOOK_SECRET
-    try:
-        r = HTTP.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
-            json=params,
-            timeout=15,
-        )
-        return {"status": "ok", "telegram_response": r.json()}, 200
-    except Exception as exc:
-        return {"status": "error", "details": str(exc)}, 500
-
-
 def _handle_telegram_command(cmd: str) -> None:
-    """Traite une commande Telegram reçue via webhook."""
     if cmd == "/scan":
         now_ts = time.time()
         last_manual = SCAN_STATE.get("last_manual_trigger_at")
-
         if SCAN_STATE.get("running"):
             send_telegram_message("⏳ Un scan est déjà en cours. Attends sa fin.")
             return
-
         if last_manual and (now_ts - last_manual) < SCAN_COOLDOWN_SECONDS:
             wait_left = int(SCAN_COOLDOWN_SECONDS - (now_ts - last_manual))
             send_telegram_message(f"⏳ Cooldown actif. Réessaie dans {wait_left}s.")
             return
-
         SCAN_STATE["last_manual_trigger_at"] = now_ts
-        send_telegram_message(
-            "🔍 Scan lancé manuellement...\n"
-            "Analyse 1X2 + Buts + BTTS en cours."
-        )
-        threading.Thread(
-            target=lambda: run_full_scan_job(trigger="manual"),
-            daemon=True,
-            name="ManualScan",
-        ).start()
+        send_telegram_message("🔍 Scan lancé manuellement...\nAnalyse Dixon-Coles en cours.")
+        threading.Thread(target=lambda: run_full_scan_job(trigger="manual"),
+                         daemon=True, name="ManualScan").start()
 
     elif cmd == "/status":
+        bankroll = get_bankroll()
         send_telegram_message(
-            f"✅ APEX-SIRIUS BOT ACTIF\n\n"
-            f"🔧 Build: {BUILD_ID}\n"
-            f"🕐 Heure UTC: {now_utc().strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"API-Football : {'✅' if API_KEY else '❌ MANQUANT'}\n"
-            f"FootyStats   : {'✅' if FOOTYSTATS_KEY else '❌ MANQUANT'}\n"
-            f"Odds API     : {'✅' if ODDS_API_KEY else '❌ MANQUANT'}\n"
+            f"✅ <b>APEX-HYBRID-ULTIMATE v2.0</b>\n\n"
+            f"🔧 Build: <code>{BUILD_ID}</code>\n"
+            f"🕐 UTC: {now_utc().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"API-Football : {'✅' if API_KEY else '❌'}\n"
+            f"FootyStats   : {'✅' if FOOTYSTATS_KEY else '❌'}\n"
+            f"Odds API     : {'✅' if ODDS_API_KEY else '❌'}\n"
             f"Telegram     : ✅\n\n"
-            f"⏰ Scheduler : toutes les heures, {SCAN_START_HOUR}h00–{SCAN_END_HOUR}h00 UTC\n"
-            f"📚 Bookmakers : {ODDS_API_BOOKMAKERS}"
+            f"💰 Bankroll: <b>{bankroll:.2f}</b>\n"
+            f"⏰ Scheduler: {SCAN_START_HOUR}h–{SCAN_END_HOUR}h UTC\n"
+            f"🎯 Moteur: Dixon-Coles + Kelly"
         )
+
+    elif cmd == "/bankroll":
+        bankroll = get_bankroll()
+        send_telegram_message(f"💰 Bankroll actuelle: <b>{bankroll:.2f}</b>")
 
     elif cmd == "/ping":
         send_telegram_message(f"🏓 Pong! Bot actif — {now_utc().strftime('%H:%M')} UTC")
 
     elif cmd == "/help":
         send_telegram_message(
-            "📋 Commandes disponibles :\n\n"
-            "/scan — Lance un scan complet (1X2 + Buts + BTTS)\n"
-            "/status — État du bot et des APIs\n"
-            "/ping — Test de connexion\n"
+            "📋 <b>Commandes APEX-ULTIMATE</b>\n\n"
+            "/scan — Lance un scan complet\n"
+            "/status — État bot + bankroll\n"
+            "/bankroll — Bankroll actuelle\n"
+            "/ping — Test connexion\n"
             "/help — Cette aide\n\n"
-            f"⏰ Scan automatique toutes les heures de {SCAN_START_HOUR}h00 à {SCAN_END_HOUR}h00 UTC"
+            f"⏰ Scan auto: toutes les heures {SCAN_START_HOUR}h–{SCAN_END_HOUR}h UTC\n"
+            "🎲 Modes: BET (cotes + Kelly) | SIGNAL (modèle seul)"
         )
-
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
-    # Vérification du secret header si configuré
     if WEBHOOK_SECRET:
         incoming = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if incoming != WEBHOOK_SECRET:
             return jsonify({"status": "forbidden"}), 403
-
     update = request.get_json(silent=True) or {}
     message = update.get("message") or update.get("channel_post") or {}
     text = (message.get("text") or "").strip()
-    chat_id = str(message.get("chat", {}).get("id") or "")
-
-    if not text or not chat_id:
+    if not text:
         return ok({"status": "ok", "ignored": True})
-
-    # Supprime la mention @bot si présente
     cmd = text.split()[0].lower().split("@")[0]
     _handle_telegram_command(cmd)
-
     return ok({"status": "ok"})
-
 
 @app.route("/set-webhook")
 def set_webhook_route():
-    """Active le webhook Telegram — appelle cette route une fois après déploiement."""
     webhook_url = request.args.get("url", "").strip()
     if not webhook_url:
-        # Auto-détection de l'URL publique
         webhook_url = request.url_root.rstrip("/") + "/webhook"
     payload, status = set_telegram_webhook(webhook_url)
-    return ok({
-        "status": "ok" if status == 200 else "error",
-        "webhook_url": webhook_url,
-        "result": payload,
-    }, status)
-
+    return ok({"status": "ok" if status == 200 else "error",
+               "webhook_url": webhook_url, "result": payload}, status)
 
 # ============================================================
-# ROUTES
+# FLASK ROUTES
 # ============================================================
-@app.route("/")
-def home():
-    return ok({
-        "status": "ok",
-        "build_id": BUILD_ID,
-        "routes": [
-            "/", "/version", "/ping", "/telegram-test",
-            "/footystats-test", "/odds-api-test?sport=soccer_epl",
-            "/set-webhook", "/webhook (POST)",
-            "/fixtures-today", "/fixtures-prematch-ready",
-            "/fixture-value?fixture_id=...",
-            "/fixture-goals-value?fixture_id=...",
-            "/scan-value?date=YYYY-MM-DD&min_level=2&send_telegram=1",
-            "/scan-goals?date=YYYY-MM-DD&min_level=2&send_telegram=1",
-            "/debug-fixture-value?fixture_id=...",
-        ],
-        "config": {
-            "bot_token_present": bool(BOT_TOKEN),
-            "chat_id_present": bool(CHAT_ID),
-            "api_key_present": bool(API_KEY),
-            "footystats_key_present": bool(FOOTYSTATS_KEY),
-            "odds_api_key_present": bool(ODDS_API_KEY),
-            "odds_api_bookmakers": ODDS_API_BOOKMAKERS,
-        },
-    })
-
-
 @app.route("/health")
 def health():
     return jsonify({
@@ -2441,6 +1567,7 @@ def health():
         "last_error": SCAN_STATE.get("last_error"),
         "last_duration_seconds": SCAN_STATE.get("last_duration_seconds"),
         "last_signals_sent": SCAN_STATE.get("last_signals_sent"),
+        "bankroll": get_bankroll(),
         "config": {
             "api_football": bool(API_KEY),
             "footystats": bool(FOOTYSTATS_KEY),
@@ -2448,112 +1575,100 @@ def health():
             "telegram_bot": bool(BOT_TOKEN),
             "telegram_chat": bool(CHAT_ID),
             "webhook_secret": bool(WEBHOOK_SECRET),
+            "engine": "Dixon-Coles + Kelly",
+            "leagues_configured": len(LEAGUE_CONFIG),
         },
     }), 200
 
+@app.route("/")
+def home():
+    return ok({
+        "status": "ok",
+        "build_id": BUILD_ID,
+        "engine": "Dixon-Coles + Kelly",
+        "routes": [
+            "/", "/health", "/version", "/ping",
+            "/telegram-test", "/set-webhook", "/webhook (POST)",
+            "/footystats-test", "/odds-api-test?sport=soccer_epl",
+            "/fixtures-today",
+            "/fixture-analyse?fixture_id=...",
+            "/scan-trigger",
+            "/bankroll", "/update-bankroll?amount=...",
+            "/signals-recent?limit=20",
+            "/signals-summary",
+            "/resolve-pending-signals",
+            "/admin/clean-null-odds",
+        ],
+        "config": {
+            "bot_token_present": bool(BOT_TOKEN),
+            "chat_id_present": bool(CHAT_ID),
+            "api_key_present": bool(API_KEY),
+            "footystats_key_present": bool(FOOTYSTATS_KEY),
+            "odds_api_key_present": bool(ODDS_API_KEY),
+            "leagues_configured": len(LEAGUE_CONFIG),
+        },
+    })
 
 @app.route("/version")
 def version():
     return ok({
         "status": "ok",
         "build_id": BUILD_ID,
+        "engine": "Dixon-Coles + Kelly",
+        "tiers": {"P0": "UEFA", "N1": "Top5", "N2": "Secondary", "N3": "Others"},
         "config": {
-            "api_key_present": bool(API_KEY),
-            "footystats_key_present": bool(FOOTYSTATS_KEY),
-            "odds_api_key_present": bool(ODDS_API_KEY),
-            "odds_api_bookmakers": ODDS_API_BOOKMAKERS,
-            "bot_token_present": bool(BOT_TOKEN),
-            "chat_id_present": bool(CHAT_ID),
+            "api_football": bool(API_KEY),
+            "footystats": bool(FOOTYSTATS_KEY),
+            "odds_api": bool(ODDS_API_KEY),
+            "telegram_bot": bool(BOT_TOKEN),
         },
     })
 
-
 @app.route("/ping")
 def ping():
-    return ok({
-        "status": "ok",
-        "message": "pong",
-        "utc_now": now_utc().isoformat(),
-        "build_id": BUILD_ID,
-    })
-
+    return ok({"status": "ok", "message": "pong",
+                "utc_now": now_utc().isoformat(), "build_id": BUILD_ID})
 
 @app.route("/telegram-test")
 def telegram_test():
-    payload, status_code = send_telegram_message(f"Test Telegram Apexfoot OK - {now_utc().isoformat()} | build={BUILD_ID}")
-    return ok({
-        "status": "ok" if status_code == 200 else "error",
-        "message_sent": status_code == 200,
-        "telegram_http_status": status_code,
-        "telegram_status": payload,
-        "build_id": BUILD_ID,
-    }, 200 if status_code == 200 else 500)
-
+    payload, status_code = send_telegram_message(
+        f"✅ Test APEX-ULTIMATE OK\n{now_utc().isoformat()}\nbuild={BUILD_ID}"
+    )
+    return ok({"status": "ok" if status_code == 200 else "error",
+               "message_sent": status_code == 200,
+               "telegram_http_status": status_code,
+               "telegram_status": payload, "build_id": BUILD_ID},
+              200 if status_code == 200 else 500)
 
 @app.route("/footystats-test")
 def footystats_test():
-    date_str = request.args.get("date", utc_today_str()).strip()
-    payload, status = get_footystats_matches_by_date(date_str)
-    if status != 200:
-        return ok({
-            "status": "error",
-            "build_id": BUILD_ID,
-            "footystats_key_present": bool(FOOTYSTATS_KEY),
-            "footystats_status": payload,
-        }, 500)
-
-    matches = footystats_data_as_list(payload["data"])
+    matches = get_footystats_matches_cached()
     sample = matches[0] if matches else None
     return ok({
         "status": "ok",
         "build_id": BUILD_ID,
         "footystats_key_present": bool(FOOTYSTATS_KEY),
-        "date": date_str,
         "count": len(matches),
         "sample": {
             "id": sample.get("id") if isinstance(sample, dict) else None,
             "home_name": sample.get("home_name") if isinstance(sample, dict) else None,
             "away_name": sample.get("away_name") if isinstance(sample, dict) else None,
-            "date_unix": sample.get("date_unix") if isinstance(sample, dict) else None,
-            "competition_id": sample.get("competition_id") if isinstance(sample, dict) else None,
         } if sample else None,
     })
-
 
 @app.route("/odds-api-test")
 def odds_api_test():
     if not ODDS_API_KEY:
-        return ok({
-            "status": "error",
-            "message": "ODDS_API_KEY is missing",
-            "build_id": BUILD_ID,
-        }, 500)
+        return ok({"status": "error", "message": "ODDS_API_KEY is missing"}, 500)
     sport_key = request.args.get("sport", "soccer_epl").strip()
     payload, status = call_odds_api(sport_key)
     if status != 200:
-        return ok({
-            "status": "error",
-            "build_id": BUILD_ID,
-            "odds_api_key_present": bool(ODDS_API_KEY),
-            "odds_api_status": payload,
-        }, 500)
+        return ok({"status": "error", "odds_api_status": payload}, 500)
     events = payload.get("data") or []
     sample = events[0] if events else None
-    return ok({
-        "status": "ok",
-        "build_id": BUILD_ID,
-        "odds_api_key_present": bool(ODDS_API_KEY),
-        "odds_api_bookmakers": ODDS_API_BOOKMAKERS,
-        "sport_key": sport_key,
-        "count": len(events),
-        "sample": {
-            "id": sample.get("id") if isinstance(sample, dict) else None,
-            "home_team": sample.get("home_team") if isinstance(sample, dict) else None,
-            "away_team": sample.get("away_team") if isinstance(sample, dict) else None,
-            "commence_time": sample.get("commence_time") if isinstance(sample, dict) else None,
-        } if sample else None,
-    })
-
+    return ok({"status": "ok", "sport_key": sport_key, "count": len(events),
+               "sample": {k: sample.get(k) for k in ["id", "home_team", "away_team", "commence_time"]}
+               if isinstance(sample, dict) else None})
 
 @app.route("/fixtures-today")
 def fixtures_today():
@@ -2561,338 +1676,77 @@ def fixtures_today():
     data, status_code = get_fixtures_by_date(date_str)
     if status_code != 200:
         return ok(data, status_code)
-
     fixtures = data["data"].get("response", [])
     filtered = []
     for match in fixtures:
-        if not is_target_league_by_id(match):
+        lid = match.get("league", {}).get("id")
+        if lid not in LEAGUE_CONFIG:
             continue
         if not is_priority_fixture(match):
             continue
         if not is_pre_match_fixture(match):
             continue
-        detail = build_fixture_detail(match)
+        d = build_fixture_detail(match)
+        cfg = LEAGUE_CONFIG.get(lid, {})
         filtered.append({
-            "fixture_id": detail["fixture_id"],
-            "kickoff_utc": detail["kickoff_utc"],
-            "league_id": detail["league_id"],
-            "league_name": detail["league_name"],
-            "country": detail["country"],
-            "home": detail["home"],
-            "away": detail["away"],
+            "fixture_id": d["fixture_id"],
+            "kickoff_utc": d["kickoff_utc"],
+            "league_id": d["league_id"],
+            "league_name": d["league_name"],
+            "tier": cfg.get("tier"),
+            "country": d["country"],
+            "home": d["home"],
+            "away": d["away"],
         })
-
     filtered.sort(key=lambda x: x["kickoff_utc"] or "")
-    return ok({
-        "status": "ok",
-        "build_id": BUILD_ID,
-        "date": date_str,
-        "count": len(filtered),
-        "fixtures": filtered,
-    })
+    return ok({"status": "ok", "build_id": BUILD_ID, "date": date_str,
+               "count": len(filtered), "fixtures": filtered})
 
-
-@app.route("/fixtures-prematch-ready")
-def fixtures_prematch_ready():
-    return fixtures_today()
-
-
-@app.route("/fixture-value")
-def fixture_value():
+@app.route("/fixture-analyse")
+def fixture_analyse():
     fixture_id = request.args.get("fixture_id", "").strip()
-    if not fixture_id:
-        return err("Missing 'fixture_id' query parameter", 400)
-    if not fixture_id.isdigit():
-        return err("fixture_id must be numeric", 400)
-
-    analysis, status = analyse_fixture_value_core(fixture_id)
+    if not fixture_id or not fixture_id.isdigit():
+        return err("fixture_id numeric requis", 400)
+    signal, status = analyse_fixture_core(fixture_id)
     if status != 200:
-        return ok(analysis, status)
+        return ok(signal, status)
+    if signal is None:
+        return ok({"status": "ok", "decision": "NO_BET", "fixture_id": fixture_id})
+    # Envoi Telegram optionnel
+    if request.args.get("send_telegram") == "1" and signal:
+        tg_data, tg_status = send_telegram_message(format_signal_message(signal))
+        log_signal(signal, tg_data=tg_data, tg_status=tg_status)
+        signal["telegram_sent"] = tg_status == 200
+    return ok(signal)
 
-    send_telegram = request.args.get("send_telegram", "0").strip() == "1"
-    telegram_status = None
-    telegram_http_status = None
+@app.route("/scan-trigger")
+def scan_trigger():
+    """Déclenche un scan manuel via HTTP."""
+    if SCAN_STATE.get("running"):
+        return ok({"status": "busy", "message": "scan already running"}, 202)
+    threading.Thread(target=lambda: run_full_scan_job(trigger="http"),
+                     daemon=True, name="HttpScan").start()
+    return ok({"status": "ok", "message": "scan triggered"})
 
-    if send_telegram and analysis.get("decision") != "NO_BET":
-        telegram_status, telegram_http_status = send_telegram_message(
-            summarize_1x2_signal(analysis["fixture"], analysis, analysis["odds_1x2"])
-        )
+@app.route("/bankroll")
+def bankroll_route():
+    amount = get_bankroll()
+    return ok({"status": "ok", "bankroll": amount, "currency": "units"})
 
-    analysis["telegram_status"] = telegram_status
-    analysis["telegram_http_status"] = telegram_http_status
-    return ok(analysis, 200)
-
-
-@app.route("/fixture-goals-value")
-def fixture_goals_value():
-    fixture_id = request.args.get("fixture_id", "").strip()
-    if not fixture_id:
-        return err("Missing 'fixture_id' query parameter", 400)
-    if not fixture_id.isdigit():
-        return err("fixture_id must be numeric", 400)
-
-    analysis, status = analyse_fixture_goals_core(fixture_id)
-    if status != 200:
-        return ok(analysis, status)
-
-    send_telegram = request.args.get("send_telegram", "0").strip() == "1"
-    telegram_status = None
-    telegram_http_status = None
-
-    if send_telegram and analysis.get("decision") != "NO_BET":
-        telegram_status, telegram_http_status = send_telegram_message(
-            summarize_goals_signal(analysis["fixture"], analysis)
-        )
-
-    analysis["telegram_status"] = telegram_status
-    analysis["telegram_http_status"] = telegram_http_status
-    return ok(analysis, 200)
-
-
-@app.route("/scan-value")
-def scan_value():
-    date_str = request.args.get("date", utc_today_str()).strip()
-    min_level = maybe_int(request.args.get("min_level", 2)) or 2
-    send_telegram = request.args.get("send_telegram", "1").strip() != "0"
-
-    fixtures_data, fixtures_status = get_fixtures_by_date(date_str)
-    if fixtures_status != 200:
-        return ok(fixtures_data, fixtures_status)
-
-    fixtures = fixtures_data["data"].get("response", [])
-    footy_matches = None
-    if FOOTYSTATS_KEY:
-        footy_payload, footy_status = get_footystats_matches_by_date(date_str)
-        if footy_status == 200:
-            footy_matches = footystats_data_as_list(footy_payload["data"])
-
-    signals = []
-    telegram_results = []
-
-    for match in fixtures:
-        if not is_target_league_by_id(match):
-            continue
-        if not is_priority_fixture(match):
-            continue
-        if not is_pre_match_fixture(match):
-            continue
-
-        detail = build_fixture_detail(match)
-        analysis, status = analyse_fixture_value_core(str(detail["fixture_id"]), preloaded_footy_matches=footy_matches)
-        if status != 200 or analysis.get("decision") == "NO_BET":
-            continue
-        if (analysis.get("level") or 0) < min_level:
-            continue
-
-        signal = {
-            "fixture_id": detail["fixture_id"],
-            "kickoff_utc": detail["kickoff_utc"],
-            "league_name": detail["league_name"],
-            "country": detail["country"],
-            "home": detail["home"],
-            "away": detail["away"],
-            "decision": analysis["decision"],
-            "side": analysis["side"],
-            "odd": analysis["odds_1x2"].get(analysis["side"]) if analysis.get("side") else None,
-            "level": analysis["level"],
-            "level_name": analysis["level_name"],
-            "best_edge_value": analysis["best_edge_value"],
-            "raw_best_edge_value": analysis["raw_best_edge_value"],
-            "confluence_count": analysis["confluence_count"],
-            "contextual_flags": analysis["contextual_flags"],
-            "contextual_penalties": analysis["contextual_penalties"],
-            "footystats_match_found": analysis["footystats"]["match_found"],
-        }
-        signals.append(signal)
-
-        if send_telegram:
-            tg_payload, tg_status = send_telegram_message(
-                summarize_1x2_signal(analysis["fixture"], analysis, analysis["odds_1x2"])
-            )
-            telegram_results.append({
-                "fixture_id": detail["fixture_id"],
-                "telegram_http_status": tg_status,
-                "telegram_status": tg_payload,
-            })
-
-        if len(signals) >= MAX_SCAN_RESULTS:
-            break
-
-    signals.sort(key=lambda x: (x["level"], x["best_edge_value"] or -999), reverse=True)
-
-    if not signals and send_telegram:
-        telegram_results.append({
-            "status": "info",
-            "message": "Aucun signal à envoyer pour ce scan.",
-            "config": {
-                "bot_token_present": bool(BOT_TOKEN),
-                "chat_id_present": bool(CHAT_ID),
-            },
-        })
-
-    return ok({
-        "status": "ok",
-        "build_id": BUILD_ID,
-        "date": date_str,
-        "min_level": min_level,
-        "count": len(signals),
-        "signals": signals,
-        "telegram_enabled": send_telegram,
-        "telegram_config": {
-            "bot_token_present": bool(BOT_TOKEN),
-            "chat_id_present": bool(CHAT_ID),
-        },
-        "telegram_results": telegram_results,
-        "footystats_key_present": bool(FOOTYSTATS_KEY),
-    })
-
-
-@app.route("/scan-goals")
-def scan_goals():
-    date_str = request.args.get("date", utc_today_str()).strip()
-    min_level = maybe_int(request.args.get("min_level", 2)) or 2
-    send_telegram = request.args.get("send_telegram", "1").strip() != "0"
-
-    fixtures_data, fixtures_status = get_fixtures_by_date(date_str)
-    if fixtures_status != 200:
-        return ok(fixtures_data, fixtures_status)
-
-    fixtures = fixtures_data["data"].get("response", [])
-    footy_matches = None
-    if FOOTYSTATS_KEY:
-        footy_payload, footy_status = get_footystats_matches_by_date(date_str)
-        if footy_status == 200:
-            footy_matches = footystats_data_as_list(footy_payload["data"])
-
-    signals = []
-    telegram_results = []
-
-    for match in fixtures:
-        if not is_target_league_by_id(match):
-            continue
-        if not is_priority_fixture(match):
-            continue
-        if not is_pre_match_fixture(match):
-            continue
-
-        detail = build_fixture_detail(match)
-        analysis, status = analyse_fixture_goals_core(str(detail["fixture_id"]), preloaded_footy_matches=footy_matches)
-        if status != 200 or analysis.get("decision") == "NO_BET":
-            continue
-        if (analysis.get("level") or 0) < min_level:
-            continue
-
-        signal = {
-            "fixture_id": detail["fixture_id"],
-            "kickoff_utc": detail["kickoff_utc"],
-            "league_name": detail["league_name"],
-            "country": detail["country"],
-            "home": detail["home"],
-            "away": detail["away"],
-            "decision": analysis["decision"],
-            "market": analysis["market"],
-            "level": analysis["level"],
-            "level_name": analysis["level_name"],
-            "confidence_count": analysis["confidence_count"],
-            "footystats_match_found": analysis["footystats"]["match_found"],
-        }
-        signals.append(signal)
-
-        if send_telegram:
-            tg_payload, tg_status = send_telegram_message(summarize_goals_signal(analysis["fixture"], analysis))
-            telegram_results.append({
-                "fixture_id": detail["fixture_id"],
-                "telegram_http_status": tg_status,
-                "telegram_status": tg_payload,
-            })
-
-        if len(signals) >= MAX_SCAN_RESULTS:
-            break
-
-    signals.sort(key=lambda x: (x["level"], x["confidence_count"]), reverse=True)
-
-    if not signals and send_telegram:
-        telegram_results.append({
-            "status": "info",
-            "message": "Aucun signal à envoyer pour ce scan.",
-            "config": {
-                "bot_token_present": bool(BOT_TOKEN),
-                "chat_id_present": bool(CHAT_ID),
-            },
-        })
-
-    return ok({
-        "status": "ok",
-        "build_id": BUILD_ID,
-        "date": date_str,
-        "min_level": min_level,
-        "count": len(signals),
-        "signals": signals,
-        "telegram_enabled": send_telegram,
-        "telegram_config": {
-            "bot_token_present": bool(BOT_TOKEN),
-            "chat_id_present": bool(CHAT_ID),
-        },
-        "telegram_results": telegram_results,
-        "footystats_key_present": bool(FOOTYSTATS_KEY),
-    })
-
-
-@app.route("/debug-fixture-value")
-def debug_fixture_value():
-    fixture_id = request.args.get("fixture_id", "").strip()
-    if not fixture_id:
-        return err("Missing 'fixture_id' query parameter", 400)
-    if not fixture_id.isdigit():
-        return err("fixture_id must be numeric", 400)
-
-    fixture_payload, fixture_status = get_fixture_by_id(fixture_id)
-    if fixture_status != 200:
-        return ok({
-            "status": "error",
-            "build_id": BUILD_ID,
-            "fixture_lookup": fixture_payload,
-        }, fixture_status)
-
-    detail = build_fixture_detail(fixture_payload["fixture"])
-    footy_payload = get_footystats_for_fixture(detail)
-    footy_features = build_footystats_features(footy_payload)
-
-    return ok({
-        "status": "ok",
-        "build_id": BUILD_ID,
-        "fixture": detail,
-        "footystats": footy_payload,
-        "footystats_features": footy_features,
-    })
-
-
-# ============================================================
-# ROUTES SQLITE / BACKTEST
-# ============================================================
-@app.route("/admin/clean-null-odds")
-def clean_null_odds():
-    """Supprime les paris goals pending sans cote — à appeler une seule fois."""
-    with closing(db_connect()) as conn:
-        cur = conn.execute("""
-            DELETE FROM signals
-            WHERE market IN ('BTTS_YES','BTTS_NO','OVER_2_5','UNDER_2_5')
-              AND odd IS NULL
-              AND result_status = 'pending'
-        """)
-        deleted = cur.rowcount
-        conn.commit()
-        remaining = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-    logger.info("clean-null-odds: deleted=%s remaining=%s", deleted, remaining)
-    return ok({"status": "ok", "deleted": deleted, "remaining": remaining})
-
+@app.route("/update-bankroll")
+def update_bankroll():
+    amount_str = request.args.get("amount", "").strip()
+    amount = maybe_float(amount_str)
+    if amount is None or amount <= 0:
+        return err("amount doit être un nombre positif", 400)
+    set_bankroll(amount)
+    return ok({"status": "ok", "bankroll": amount})
 
 @app.route("/resolve-pending-signals")
 def resolve_pending_signals_route():
     limit = maybe_int(request.args.get("limit")) or RESOLVE_BATCH_LIMIT
     result = resolve_pending_signals(limit=limit)
-    return ok(result, 200)
-
+    return ok(result)
 
 @app.route("/signals-summary")
 def signals_summary():
@@ -2900,74 +1754,98 @@ def signals_summary():
         overall = conn.execute("""
             SELECT
                 COUNT(*) AS total_bets,
-                SUM(CASE WHEN bet_outcome = 'win' THEN 1 ELSE 0 END) AS wins,
-                SUM(CASE WHEN bet_outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
-                SUM(CASE WHEN bet_outcome = 'void' THEN 1 ELSE 0 END) AS voids,
-                ROUND(COALESCE(SUM(profit), 0), 4) AS profit_total,
-                ROUND(COALESCE(SUM(stake), 0), 4) AS stake_total,
-                ROUND(
-                    CASE WHEN COALESCE(SUM(stake), 0) > 0
-                    THEN (SUM(profit) / SUM(stake)) * 100
-                    ELSE 0 END, 2
-                ) AS roi_percent
-            FROM signals WHERE result_status = 'resolved'
+                SUM(CASE WHEN bet_outcome='win' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN bet_outcome='loss' THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN bet_outcome='void' THEN 1 ELSE 0 END) AS voids,
+                ROUND(COALESCE(SUM(profit),0),4) AS profit_total,
+                ROUND(COALESCE(SUM(stake),0),4) AS stake_total,
+                ROUND(CASE WHEN COALESCE(SUM(stake),0)>0
+                    THEN (SUM(profit)/SUM(stake))*100 ELSE 0 END,2) AS roi_percent
+            FROM signals WHERE result_status='resolved'
         """).fetchone()
-
-        by_market = conn.execute("""
-            SELECT market,
+        by_tier = conn.execute("""
+            SELECT tier,
                 COUNT(*) AS total_bets,
-                SUM(CASE WHEN bet_outcome = 'win' THEN 1 ELSE 0 END) AS wins,
-                SUM(CASE WHEN bet_outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
-                ROUND(COALESCE(SUM(profit), 0), 4) AS profit_total,
-                ROUND(
-                    CASE WHEN COALESCE(SUM(stake), 0) > 0
-                    THEN (SUM(profit) / SUM(stake)) * 100
-                    ELSE 0 END, 2
-                ) AS roi_percent
-            FROM signals WHERE result_status = 'resolved'
-            GROUP BY market ORDER BY profit_total DESC
+                SUM(CASE WHEN bet_outcome='win' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN bet_outcome='loss' THEN 1 ELSE 0 END) AS losses,
+                ROUND(COALESCE(SUM(profit),0),4) AS profit_total,
+                ROUND(CASE WHEN COALESCE(SUM(stake),0)>0
+                    THEN (SUM(profit)/SUM(stake))*100 ELSE 0 END,2) AS roi_percent
+            FROM signals WHERE result_status='resolved'
+            GROUP BY tier ORDER BY profit_total DESC
         """).fetchall()
-
-        by_level = conn.execute("""
-            SELECT level, level_name,
+        by_mode = conn.execute("""
+            SELECT mode,
                 COUNT(*) AS total_bets,
-                SUM(CASE WHEN bet_outcome = 'win' THEN 1 ELSE 0 END) AS wins,
-                SUM(CASE WHEN bet_outcome = 'loss' THEN 1 ELSE 0 END) AS losses,
-                ROUND(COALESCE(SUM(profit), 0), 4) AS profit_total,
-                ROUND(
-                    CASE WHEN COALESCE(SUM(stake), 0) > 0
-                    THEN (SUM(profit) / SUM(stake)) * 100
-                    ELSE 0 END, 2
-                ) AS roi_percent
-            FROM signals WHERE result_status = 'resolved'
-            GROUP BY level, level_name ORDER BY level DESC
+                SUM(CASE WHEN bet_outcome='win' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN bet_outcome='loss' THEN 1 ELSE 0 END) AS losses,
+                ROUND(COALESCE(SUM(profit),0),4) AS profit_total
+            FROM signals WHERE result_status='resolved'
+            GROUP BY mode
         """).fetchall()
-
+        by_side = conn.execute("""
+            SELECT side,
+                COUNT(*) AS total_bets,
+                SUM(CASE WHEN bet_outcome='win' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN bet_outcome='loss' THEN 1 ELSE 0 END) AS losses,
+                ROUND(COALESCE(SUM(profit),0),4) AS profit_total
+            FROM signals WHERE result_status='resolved'
+            GROUP BY side ORDER BY profit_total DESC
+        """).fetchall()
     return ok({
         "status": "ok",
         "build_id": BUILD_ID,
+        "bankroll": get_bankroll(),
         "overall": dict(overall) if overall else {},
-        "by_market": [dict(r) for r in by_market],
-        "by_level": [dict(r) for r in by_level],
-    }, 200)
-
+        "by_tier": [dict(r) for r in by_tier],
+        "by_mode": [dict(r) for r in by_mode],
+        "by_side": [dict(r) for r in by_side],
+    })
 
 @app.route("/signals-recent")
 def signals_recent():
     limit = maybe_int(request.args.get("limit")) or 20
+    tier = request.args.get("tier")
+    mode = request.args.get("mode")
     with closing(db_connect()) as conn:
-        rows = conn.execute("""
-            SELECT * FROM signals ORDER BY created_at DESC LIMIT ?
-        """, (limit,)).fetchall()
-    return ok({
-        "status": "ok",
-        "count": len(rows),
-        "signals": [dict(r) for r in rows],
-    }, 200)
+        query = "SELECT * FROM signals"
+        conditions = []
+        params = []
+        if tier:
+            conditions.append("tier=?")
+            params.append(tier)
+        if mode:
+            conditions.append("mode=?")
+            params.append(mode.upper())
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+    return ok({"status": "ok", "count": len(rows),
+               "signals": [dict(r) for r in rows]})
 
+@app.route("/admin/clean-null-odds")
+def clean_null_odds():
+    with closing(db_connect()) as conn:
+        cur = conn.execute("""
+            DELETE FROM signals
+            WHERE market='1X2' AND mode='BET' AND odd IS NULL AND result_status='pending'
+        """)
+        deleted = cur.rowcount
+        conn.commit()
+        remaining = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    logger.info("clean-null-odds: deleted=%s remaining=%s", deleted, remaining)
+    return ok({"status": "ok", "deleted": deleted, "remaining": remaining})
+
+# ============================================================
+# DÉMARRAGE
+# ============================================================
+start_scheduler_if_enabled()
+init_db()
+logger.info("DB initialized at %s | BUILD=%s", DB_PATH, BUILD_ID)
 
 if __name__ == "__main__":
-    init_db()
-    print(f"🚀 BUILD_ID={BUILD_ID}")
     port = int(os.environ.get("PORT", 10000))
+    logger.info("🚀 BUILD_ID=%s | port=%s", BUILD_ID, port)
     app.run(host="0.0.0.0", port=port)
