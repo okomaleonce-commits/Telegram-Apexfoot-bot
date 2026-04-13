@@ -1891,14 +1891,49 @@ Si le message n'a rien à voir avec le football ou les paris, réponds :
 
 Ne produis JAMAIS de JSON sauf dans les deux cas ci-dessus."""
 
+def parse_match_fallback(user_text: str) -> Optional[Dict]:
+    """
+    Parser simple sans LLM — extrait Home vs Away et date si Claude est indisponible.
+    Reconnaît: 'Arsenal vs Chelsea', 'Real Madrid - Barca 15/04', etc.
+    """
+    text = user_text.strip()
+    # Pattern: Equipe1 vs/contre/- Equipe2
+    patterns = [
+        r"(.+?)\s+(?:vs\.?|contre|-)\s+(.+?)(?:\s+(\d{1,2}[/.-]\d{1,2}(?:[/.-]\d{2,4})?))?$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            home = m.group(1).strip()
+            away = m.group(2).strip()
+            date_raw = m.group(3) if m.lastindex >= 3 else None
+            # Normalise la date
+            date_str = utc_today_str()
+            if date_raw:
+                try:
+                    parts = re.split(r"[/.-]", date_raw)
+                    if len(parts) >= 2:
+                        day, month = int(parts[0]), int(parts[1])
+                        year = int(parts[2]) if len(parts) > 2 else now_utc().year
+                        date_str = f"{year:04d}-{month:02d}-{day:02d}"
+                except Exception:
+                    pass
+            if len(home) >= 3 and len(away) >= 3:
+                return {"action": "analyse", "home": home, "away": away, "date": date_str}
+    return None
+
+
 def analyze_user_intent_claude(user_text: str) -> Tuple[Optional[Dict], Optional[str]]:
     """
     Utilise Claude pour comprendre l'intention de l'utilisateur.
-    Retourne (data_dict, None) si analyse de match détectée,
-    ou (None, texte_réponse) pour une conversation générale.
+    Fallback vers parser simple si Claude indisponible.
     """
     if not ANTHROPIC_API_KEY:
-        return None, "⚠️ ANTHROPIC_API_KEY manquante. Configure-la sur Render."
+        # Fallback direct sans Claude
+        data = parse_match_fallback(user_text)
+        if data:
+            return data, None
+        return None, "⚠️ ANTHROPIC_API_KEY manquante. Tu peux quand même écrire: <i>Arsenal vs Chelsea</i>"
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -1924,11 +1959,24 @@ def analyze_user_intent_claude(user_text: str) -> Tuple[Optional[Dict], Optional
             return None, content
 
     except anthropic.APIError as e:
-        logger.error("Claude API error: %s", e)
-        return None, f"⚠️ Erreur API Claude: {str(e)[:100]}"
+        full_error = str(e)
+        logger.error("Claude API error (full): %s", full_error)
+        # Fallback parser simple
+        data = parse_match_fallback(user_text)
+        if data:
+            return data, None
+        if "credit" in full_error.lower() or "billing" in full_error.lower():
+            return None, "⚠️ Compte Anthropic: crédits insuffisants. Recharge sur console.anthropic.com\nEn attendant, écris: <i>Arsenal vs Chelsea</i>"
+        elif "authentication" in full_error.lower() or ("invalid" in full_error.lower() and "key" in full_error.lower()):
+            return None, "⚠️ Clé ANTHROPIC_API_KEY invalide. Vérifie sur Render → Environment.\nEn attendant, écris: <i>Arsenal vs Chelsea 15/04</i>"
+        else:
+            return None, f"⚠️ Erreur Claude:\n<code>{full_error[:300]}</code>"
     except Exception as e:
         logger.exception("analyze_user_intent_claude failed")
-        return None, "⚠️ Je suis indisponible momentanément. Réessaie."
+        data = parse_match_fallback(user_text)
+        if data:
+            return data, None
+        return None, f"⚠️ Erreur inattendue: {str(e)[:200]}"
 
 
 def handle_agent_message(user_text: str) -> None:
