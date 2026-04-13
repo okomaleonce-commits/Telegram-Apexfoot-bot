@@ -21,6 +21,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import anthropic
 import schedule
 from flask import Flask, jsonify, request
 from requests.adapters import HTTPAdapter
@@ -41,6 +42,7 @@ FOOTYSTATS_KEY      = os.environ.get("FOOTYSTATS_KEY")
 ODDS_API_KEY        = os.environ.get("ODDS_API_KEY")
 ODDS_API_BOOKMAKERS = os.environ.get("ODDS_API_BOOKMAKERS", "bet365,unibet")
 WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")
+ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 
 DB_PATH              = os.environ.get("DB_PATH", "/tmp/apex_signals.db")
 DEFAULT_BANKROLL     = float(os.environ.get("DEFAULT_BANKROLL", "100.0"))
@@ -1836,10 +1838,12 @@ def _handle_telegram_command(cmd: str) -> None:
             f"API-Football : {'✅' if API_KEY else '❌'}\n"
             f"FootyStats   : {'✅' if FOOTYSTATS_KEY else '❌'}\n"
             f"Odds API     : {'✅' if ODDS_API_KEY else '❌'}\n"
-            f"Telegram     : ✅\n\n"
+            f"Telegram     : ✅\n"
+            f"Agent Claude : {'✅' if ANTHROPIC_API_KEY else '❌ ANTHROPIC_API_KEY manquante'}\n\n"
             f"💰 Bankroll: <b>{bankroll:.2f}</b>\n"
             f"⏰ Scheduler: {SCAN_START_HOUR}h–{SCAN_END_HOUR}h UTC\n"
-            f"🎯 Moteur: Dixon-Coles + Kelly"
+            f"🎯 Moteur: Dixon-Coles + Kelly\n"
+            f"🧠 Agent: Claude Haiku (texte libre)"
         )
 
     elif cmd == "/bankroll":
@@ -1857,9 +1861,170 @@ def _handle_telegram_command(cmd: str) -> None:
             "/bankroll — Bankroll actuelle\n"
             "/ping — Test connexion\n"
             "/help — Cette aide\n\n"
+            "🧠 <b>Mode Agent (texte libre)</b>\n"
+            "Tu peux aussi écrire directement :\n"
+            "<i>\"Arsenal vs Chelsea demain\"</i>\n"
+            "<i>\"Analyse Real Madrid Barca\"</i>\n"
+            "<i>\"C'est quoi le Kelly ?\"</i>\n\n"
             f"⏰ Scan auto: toutes les heures {SCAN_START_HOUR}h–{SCAN_END_HOUR}h UTC\n"
             "🎲 Modes: BET (cotes + Kelly) | SIGNAL (modèle seul)"
         )
+
+# ============================================================
+# AGENT CLAUDE — CERVEAU CONVERSATIONNEL
+# ============================================================
+AGENT_SYSTEM_PROMPT = """Tu es APEX-AGENT, un assistant expert en analyse de paris sportifs.
+Tu travailles avec le moteur APEX-HYBRID-ULTIMATE basé sur Dixon-Coles et Kelly.
+
+Quand l'utilisateur te parle d'un match, tu dois extraire :
+- Les noms des équipes (home, away)
+- La date si mentionnée (optionnel)
+- La ligue si mentionnée (optionnel)
+
+Si l'utilisateur demande une analyse de match, réponds UNIQUEMENT avec du JSON valide :
+{"action": "analyse", "home": "NomEquipe1", "away": "NomEquipe2", "date": "YYYY-MM-DD ou null", "league": "nom ou null"}
+
+Si l'utilisateur pose une question générale sur les paris, les probabilités, la stratégie Kelly, ou ton fonctionnement, réponds en français de façon concise et experte.
+
+Si le message n'a rien à voir avec le football ou les paris, réponds :
+{"action": "hors_sujet"}
+
+Ne produis JAMAIS de JSON sauf dans les deux cas ci-dessus."""
+
+def analyze_user_intent_claude(user_text: str) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Utilise Claude pour comprendre l'intention de l'utilisateur.
+    Retourne (data_dict, None) si analyse de match détectée,
+    ou (None, texte_réponse) pour une conversation générale.
+    """
+    if not ANTHROPIC_API_KEY:
+        return None, "⚠️ ANTHROPIC_API_KEY manquante. Configure-la sur Render."
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",  # rapide + économique
+            max_tokens=512,
+            system=AGENT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_text}]
+        )
+        content = message.content[0].text.strip()
+
+        # Tente de parser en JSON
+        try:
+            data = json.loads(content)
+            if data.get("action") == "analyse" and data.get("home") and data.get("away"):
+                return data, None
+            elif data.get("action") == "hors_sujet":
+                return None, "⚽ Je suis spécialisé dans l'analyse de matchs de football. Dis-moi un match à analyser !"
+            else:
+                return None, content  # Réponse conversationnelle directe
+        except json.JSONDecodeError:
+            # Claude a répondu en texte libre (réponse générale)
+            return None, content
+
+    except anthropic.APIError as e:
+        logger.error("Claude API error: %s", e)
+        return None, f"⚠️ Erreur API Claude: {str(e)[:100]}"
+    except Exception as e:
+        logger.exception("analyze_user_intent_claude failed")
+        return None, "⚠️ Je suis indisponible momentanément. Réessaie."
+
+
+def handle_agent_message(user_text: str) -> None:
+    """
+    Traite un message libre (non-commande) envoyé au bot Telegram.
+    Orchestration : Claude → moteur APEX → Telegram.
+    """
+    # 1. Claude analyse l'intention
+    send_telegram_message("🧠 Analyse en cours...")
+
+    data, response_text = analyze_user_intent_claude(user_text)
+
+    # 2. Réponse conversationnelle pure
+    if response_text is not None:
+        send_telegram_message(response_text)
+        return
+
+    # 3. Demande d'analyse de match détectée
+    home = data.get("home", "")
+    away = data.get("away", "")
+    league_hint = data.get("league") or ""
+    date_hint = data.get("date") or utc_today_str()
+
+    send_telegram_message(
+        f"🔍 Match détecté : <b>{home} vs {away}</b>\n"
+        f"📅 Date: {date_hint}\n"
+        f"Récupération des données...",
+    )
+
+    # 4. Cherche le fixture_id via API-Football
+    params: Dict[str, Any] = {"date": date_hint}
+    fixtures_data, status = get_fixtures_by_date(date_hint)
+    if status != 200:
+        send_telegram_message(f"❌ Impossible de récupérer les fixtures pour {date_hint}.")
+        return
+
+    fixtures = fixtures_data["data"].get("response", [])
+    best_fixture = None
+    best_score = 0.0
+
+    for f in fixtures:
+        fh = f.get("teams", {}).get("home", {}).get("name", "")
+        fa = f.get("teams", {}).get("away", {}).get("name", "")
+        score = (team_name_similarity(home, fh) + team_name_similarity(away, fa)) / 2
+        if score > best_score:
+            best_score = score
+            best_fixture = f
+
+    if not best_fixture or best_score < 0.55:
+        # Réessaie sans filtre date (matchs des 3 prochains jours)
+        send_telegram_message(
+            f"⚠️ Match introuvable le {date_hint}.\n"
+            f"Essaie avec la date exacte : ex. *\"Arsenal Bournemouth 2026-04-15\"*"
+        )
+        return
+
+    fixture_id = str(best_fixture.get("fixture", {}).get("id", ""))
+    detail = build_fixture_detail(best_fixture)
+    league_name = detail.get("league_name", "")
+    kickoff = detail.get("kickoff_utc", "")
+
+    send_telegram_message(
+        f"✅ Fixture trouvé : <b>{detail['home']} vs {detail['away']}</b>\n"
+        f"🏆 {league_name} — {format_match_time(kickoff)}\n"
+        f"⚙️ Lancement du moteur Dixon-Coles..."
+    )
+
+    # 5. Analyse complète via le moteur
+    try:
+        signal, sig_status = analyse_fixture_core(fixture_id)
+    except Exception as exc:
+        logger.exception("analyse_fixture_core failed in agent | fixture_id=%s", fixture_id)
+        send_telegram_message(f"❌ Erreur moteur sur fixture {fixture_id}: {str(exc)[:150]}")
+        return
+
+    if sig_status != 200:
+        send_telegram_message(f"❌ Erreur API sur fixture {fixture_id}.")
+        return
+
+    if signal is None:
+        # Pas de signal BET/SIGNAL — on donne quand même les probs
+        send_telegram_message(
+            f"📊 <b>APEX-AGENT — {detail['home']} vs {detail['away']}</b>\n"
+            f"🏆 {league_name} | {format_match_time(kickoff)}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🧮 Résultat: <b>NO BET</b>\n"
+            f"Aucun edge détecté dans les paramètres actuels.\n\n"
+            f"Consulte /fixture-analyse?fixture_id={fixture_id} pour le détail complet."
+        )
+        return
+
+    # 6. Signal trouvé — formater et envoyer
+    msg = format_signal_message(signal)
+    tg_data, tg_status = send_telegram_message(msg)
+    log_signal(signal, tg_data=tg_data, tg_status=tg_status)
+
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -1872,8 +2037,20 @@ def telegram_webhook():
     text = (message.get("text") or "").strip()
     if not text:
         return ok({"status": "ok", "ignored": True})
-    cmd = text.split()[0].lower().split("@")[0]
-    _handle_telegram_command(cmd)
+
+    # Commande explicite (débute par /)
+    if text.startswith("/"):
+        cmd = text.split()[0].lower().split("@")[0]
+        _handle_telegram_command(cmd)
+    else:
+        # Message libre → Agent Claude
+        threading.Thread(
+            target=handle_agent_message,
+            args=(text,),
+            daemon=True,
+            name="AgentThread"
+        ).start()
+
     return ok({"status": "ok"})
 
 @app.route("/set-webhook")
